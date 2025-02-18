@@ -3,10 +3,13 @@ from __future__ import annotations
 
 # Filter out specific FutureWarnings from anndata and tm
 import warnings
-warnings.filterwarnings('ignore', category=FutureWarning, 
-                       module='anndata.utils')
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="anndata.utils")
 import logging
-logging.disable(logging.CRITICAL)  # disables all logging messages at and below CRITICAL level
+
+logging.disable(
+    logging.CRITICAL
+)  # disables all logging messages at and below CRITICAL level
 
 import os
 import platform
@@ -790,162 +793,243 @@ def tl_format_for_squidpy(adata, x_col, y_col):
     return new_adata
 
 
-def calculate_triangulation_distances(df_input, id, x_pos, y_pos, cell_type, region):
+def compute_triangulation_edges(df_input, x_pos, y_pos):
     """
-    Calculate distances between cells using Delaunay triangulation.
+    Compute unique Delaunay triangulation edges from input coordinates.
+
+    This function computes the Delaunay triangulation for the set of points defined by the
+    x and y positions contained in a DataFrame. It then extracts all unique edges from the
+    triangulation, calculates their Euclidean distances, and returns these as a new DataFrame.
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
-    id : str
-        Column name for cell id.
+        DataFrame containing the coordinate data.
     x_pos : str
-        Column name for x position of cells.
+        The column name in df_input for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
-    cell_type : str
-        Column name for cell type annotations.
-    region : str
-        Column name for region.
+        The column name in df_input for the y-coordinate.
 
     Returns
     -------
     pandas.DataFrame
-        Annotated result dataframe with calculated distances and additional information.
+        A DataFrame with columns:
+            - ind1: Index of the first point in each edge.
+            - ind2: Index of the second point in each edge.
+            - x1: x-coordinate of the first point.
+            - y1: y-coordinate of the first point.
+            - x2: x-coordinate of the second point.
+            - y2: y-coordinate of the second point.
+            - distance: Euclidean distance between the two points.
     """
-    # Perform Delaunay triangulation
     points = df_input[[x_pos, y_pos]].values
     tri = Delaunay(points)
-    indices = tri.simplices
 
-    # Get interactions going both directions
-    edges = set()
-    for simplex in indices:
-        for i in range(3):
-            for j in range(i + 1, 3):
-                edges.add(tuple(sorted([simplex[i], simplex[j]])))
-    edges = np.array(list(edges))
+    # Generate edges from triangles and remove duplicates
+    edges = np.vstack(
+        [tri.simplices[:, [0, 1]], tri.simplices[:, [1, 2]], tri.simplices[:, [2, 0]]]
+    )
+    # Sort each edge so that [i, j] and [j, i] are considered the same
+    edges = np.sort(edges, axis=1)
+    # Remove duplicate edges
+    edges = np.unique(edges, axis=0)
 
-    # Create dataframe from edges
-    rdelaun_result = pd.DataFrame(edges, columns=["ind1", "ind2"])
-    rdelaun_result[["x1", "y1"]] = df_input.iloc[rdelaun_result["ind1"]][
-        [x_pos, y_pos]
-    ].values
-    rdelaun_result[["x2", "y2"]] = df_input.iloc[rdelaun_result["ind2"]][
-        [x_pos, y_pos]
-    ].values
+    # Vectorized distance computation
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
 
-    # Annotate results with cell type and region information
-    df_input["XYcellID"] = (
-        df_input[x_pos].astype(str) + "_" + df_input[y_pos].astype(str)
-    )
-    rdelaun_result["cell1ID"] = (
-        rdelaun_result["x1"].astype(str) + "_" + rdelaun_result["y1"].astype(str)
-    )
-    rdelaun_result["cell2ID"] = (
-        rdelaun_result["x2"].astype(str) + "_" + rdelaun_result["y2"].astype(str)
-    )
+    ind1, ind2 = edges[:, 0], edges[:, 1]
+    x1_arr, y1_arr = x_coords[ind1], y_coords[ind1]
+    x2_arr, y2_arr = x_coords[ind2], y_coords[ind2]
 
-    annotated_result = pd.merge(
-        rdelaun_result, df_input, left_on="cell1ID", right_on="XYcellID"
-    )
-    annotated_result = annotated_result.rename(
-        columns={cell_type: "celltype1", id: "celltype1_index"}
-    )
-    annotated_result = annotated_result.drop(columns=[x_pos, y_pos, region, "XYcellID"])
+    dist_arr = np.sqrt((x2_arr - x1_arr) ** 2 + (y2_arr - y1_arr) ** 2)
 
-    annotated_result = pd.merge(
-        annotated_result,
-        df_input,
-        left_on="cell2ID",
-        right_on="XYcellID",
-        suffixes=(".x", ".y"),
-    )
-    annotated_result = annotated_result.rename(
-        columns={cell_type: "celltype2", id: "celltype2_index"}
-    )
-    annotated_result = annotated_result.drop(columns=[x_pos, y_pos, "XYcellID"])
-
-    # Calculate distance
-    annotated_result["distance"] = np.sqrt(
-        (annotated_result["x2"] - annotated_result["x1"]) ** 2
-        + (annotated_result["y2"] - annotated_result["y1"]) ** 2
-    )
-
-    # Ensure symmetry by adding reversed pairs
-    reversed_pairs = annotated_result.copy()
-    reversed_pairs = reversed_pairs.rename(
-        columns={
-            "celltype1_index": "celltype2_index",
-            "celltype1": "celltype2",
-            "celltype1_X": "celltype2_X",
-            "celltype1_Y": "celltype2_Y",
-            "celltype2_index": "celltype1_index",
-            "celltype2": "celltype1",
-            "celltype2_X": "celltype1_X",
-            "celltype2_Y": "celltype1_Y",
+    edges_df = pd.DataFrame(
+        {
+            "ind1": ind1,
+            "ind2": ind2,
+            "x1": x1_arr,
+            "y1": y1_arr,
+            "x2": x2_arr,
+            "y2": y2_arr,
+            "distance": dist_arr,
         }
     )
-    annotated_result = pd.concat([annotated_result, reversed_pairs])
+    return edges_df
 
-    # Reorder columns
+
+def annotate_triangulation_vectorized(
+    edges_df, df_input, id_col, x_pos, y_pos, cell_type_col, region
+):
+    """
+    Annotate edges with cell metadata in a vectorized manner.
+
+    This function takes the computed edges from the triangulation and annotates them with
+    additional information retrieved from the input DataFrame. It creates both the forward
+    and reverse (symmetrical) edges with cell identifiers, cell types, positions, and region info.
+
+    Parameters
+    ----------
+    edges_df : pandas.DataFrame
+        DataFrame containing the triangulation edges and their distances.
+    df_input : pandas.DataFrame
+        DataFrame containing cell metadata.
+    id_col : str
+        The column name in df_input that serves as the cell identifier.
+    x_pos : str
+        The column name in df_input for the x-coordinate.
+    y_pos : str
+        The column name in df_input for the y-coordinate.
+    cell_type_col : str
+        The column name in df_input for cell type annotation.
+    region : str
+        The column name in df_input for region information.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame containing annotated edges with the following columns:
+            - region: The region identifier.
+            - celltype1_index, celltype1, celltype1_X, celltype1_Y:
+                Information for the first cell.
+            - celltype2_index, celltype2, celltype2_X, celltype2_Y:
+                Information for the second cell.
+            - distance: The Euclidean distance between the two cells.
+    """
+    if len(df_input[region].unique()) == 1:
+        region_val = df_input[region].iloc[0]
+    else:
+        # In case of multiple regions, use the first region as annotation.
+        region_val = df_input[region].iloc[0]
+
+    # Convert needed columns to arrays for fast indexing
+    id_array = df_input[id_col].values
+    ct_array = df_input[cell_type_col].values
+    x_array = df_input[x_pos].values
+    y_array = df_input[y_pos].values
+
+    # Build references from edges DataFrame
+    ind1 = edges_df["ind1"].values
+    ind2 = edges_df["ind2"].values
+    x1_arr = edges_df["x1"].values
+    y1_arr = edges_df["y1"].values
+    x2_arr = edges_df["x2"].values
+    y2_arr = edges_df["y2"].values
+    dist_arr = edges_df["distance"].values
+
+    # Create direct "forward" annotated DataFrame
+    data_forward = pd.DataFrame(
+        {
+            region: [region_val] * len(ind1),
+            "celltype1_index": id_array[ind1],
+            "celltype1": ct_array[ind1],
+            "celltype1_X": x1_arr,
+            "celltype1_Y": y1_arr,
+            "celltype2_index": id_array[ind2],
+            "celltype2": ct_array[ind2],
+            "celltype2_X": x2_arr,
+            "celltype2_Y": y2_arr,
+            "distance": dist_arr,
+        }
+    )
+
+    # Create symmetrical (reverse) annotated DataFrame
+    data_reverse = pd.DataFrame(
+        {
+            region: [region_val] * len(ind1),
+            "celltype1_index": id_array[ind2],
+            "celltype1": ct_array[ind2],
+            "celltype1_X": x2_arr,
+            "celltype1_Y": y2_arr,
+            "celltype2_index": id_array[ind1],
+            "celltype2": ct_array[ind1],
+            "celltype2_X": x1_arr,
+            "celltype2_Y": y1_arr,
+            "distance": dist_arr,
+        }
+    )
+
+    # Concatenate forward and reverse dataframes
+    annotated_result = pd.concat([data_forward, data_reverse], ignore_index=True)
     annotated_result = annotated_result[
         [
             region,
             "celltype1_index",
             "celltype1",
-            "x1",
-            "y1",
+            "celltype1_X",
+            "celltype1_Y",
             "celltype2_index",
             "celltype2",
-            "x2",
-            "y2",
+            "celltype2_X",
+            "celltype2_Y",
             "distance",
         ]
     ]
-    annotated_result.columns = [
-        region,
-        "celltype1_index",
-        "celltype1",
-        "celltype1_X",
-        "celltype1_Y",
-        "celltype2_index",
-        "celltype2",
-        "celltype2_X",
-        "celltype2_Y",
-        "distance",
-    ]
-
     return annotated_result
 
 
-# Define the process_region function at the top level
-def process_region(df, unique_region, id, x_pos, y_pos, cell_type, region):
+def calculate_triangulation_distances(df_input, id, x_pos, y_pos, cell_type, region):
     """
-    Process a specific region of a dataframe, calculating triangulation distances.
+    Calculate and annotate triangulation distances for cells.
+
+    This function computes the triangulation edges for input cell data and then annotates
+    them with cell metadata. It serves as a wrapper combining both steps into one process.
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        Input dataframe containing cell information.
-    unique_region : str
-        Unique region identifier.
+    df_input : pandas.DataFrame
+        DataFrame containing the cell data.
     id : str
-        Column name for cell id.
+        Column name for cell identifiers.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with calculated distances and additional information for the specified region.
+        Annotated DataFrame with triangulation edges and metadata.
+    """
+    edges_df = compute_triangulation_edges(df_input, x_pos, y_pos)
+    annotated_result = annotate_triangulation_vectorized(
+        edges_df, df_input, id, x_pos, y_pos, cell_type, region
+    )
+    return annotated_result
+
+
+def process_region(df, unique_region, id, x_pos, y_pos, cell_type, region):
+    """
+    Process triangulation distances for a specific region.
+
+    This function subsets the dataframe to one specific region, adds unique identifier
+    columns, and calculates the triangulation distances for that region.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The full dataset containing cell information.
+    unique_region : str
+        The specific region to process.
+    id : str
+        Column name for cell identifiers.
+    x_pos : str
+        Column name for x-coordinate.
+    y_pos : str
+        Column name for y-coordinate.
+    cell_type : str
+        Column name for cell type information.
+    region : str
+        Column name for region information.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Annotated DataFrame with triangulation distances for the specified region.
     """
     subset = df[df[region] == unique_region].copy()
     subset["uniqueID"] = (
@@ -968,49 +1052,43 @@ def process_region(df, unique_region, id, x_pos, y_pos, cell_type, region):
 
 
 def get_triangulation_distances(
-    df_input,
-    id,
-    x_pos,
-    y_pos,
-    cell_type,
-    region,
-    num_cores=None,
-    correct_dtype=True,
-    nested=False,
+    df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, correct_dtype=True
 ):
     """
-    Calculate triangulation distances for each unique region in the input dataframe.
+    Compute triangulation distances for each unique region with parallel processing.
+
+    This function processes the input DataFrame by first ensuring datatype consistency
+    (optionally converting coordinate values to integers), and then computes triangulation
+    distances per region in parallel using half of the available CPU cores (by default).
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
+        DataFrame containing cell data including coordinates, cell types, and region info.
     id : str
-        Column name for cell id.
+        Column name for cell identifiers.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     num_cores : int, optional
-        Number of cores to use for parallel processing. If None, defaults to half of available cores.
+        Number of CPU cores to use for parallel processing. If None, defaults to half of os.cpu_count().
     correct_dtype : bool, optional
-        If True, corrects the data type of the cell_type and region columns to string.
+        Flag to convert columns to proper data types. Defaults to True.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with calculated distances and additional information for each unique region.
+        A concatenated DataFrame with triangulation distances computed for all regions.
     """
-    if correct_dtype == True:
-        # change columns to pandas string
+    if correct_dtype:
         df_input[cell_type] = df_input[cell_type].astype(str)
         df_input[region] = df_input[region].astype(str)
 
-    # Check if x_pos and y_pos are integers, and if not, convert them
     if not issubclass(df_input[x_pos].dtype.type, np.integer):
         print("This function expects integer values for xy coordinates.")
         print(
@@ -1022,56 +1100,48 @@ def get_triangulation_distances(
         df_input[x_pos] = df_input[x_pos].astype(int).values
         df_input[y_pos] = df_input[y_pos].astype(int).values
 
-    # Get unique regions
     unique_regions = df_input[region].unique()
-
-    # Select only necessary columns
     df_input = df_input.loc[:, [id, x_pos, y_pos, cell_type, region]]
 
-    # Set up parallelization
-    if nested:
-        num_cores = 1  # Use single core if called from parallel context
-    elif num_cores is None:
-        num_cores = max(1, os.cpu_count() // 2)
+    if num_cores is None:
+        num_cores = os.cpu_count() // 2
 
-    # Parallel processing using joblib
+    # Parallelize region processing
     results = Parallel(n_jobs=num_cores)(
         delayed(process_region)(df_input, reg, id, x_pos, y_pos, cell_type, region)
         for reg in unique_regions
     )
 
     triangulation_distances = pd.concat(results)
-
     return triangulation_distances
 
 
 def shuffle_annotations(df_input, cell_type, region, permutation):
     """
-    Shuffle annotations within each unique region in the input dataframe.
+    Shuffle cell type annotations within each region.
+
+    This function randomizes the cell type annotations of the input DataFrame on a per-region basis
+    using a pseudo-random permutation seed.
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
+        DataFrame containing cell data.
     cell_type : str
-        Column name for cell type annotations.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     permutation : int
-        Seed for the random number generator.
+        An integer used to seed the random number generator for reproducible shuffling.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with shuffled annotations for each unique region.
+        A copy of df_input with an added column "random_annotations" representing the shuffled cell types.
     """
-    # Set the seed for reproducibility
     np.random.seed(permutation + 1234)
-
-    # Create a copy to avoid modifying the original dataframe
     df_shuffled = df_input.copy()
 
-    # Shuffle annotations within each region
     for region_name in df_shuffled[region].unique():
         region_mask = df_shuffled[region] == region_name
         shuffled_values = df_shuffled.loc[region_mask, cell_type].sample(frac=1).values
@@ -1080,105 +1150,137 @@ def shuffle_annotations(df_input, cell_type, region, permutation):
     return df_shuffled
 
 
-def tl_iterate_tri_distances(
-    df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, num_iterations=1000
+def _process_region_iterations(
+    subset,
+    edges_df,
+    id_col,
+    x_col,
+    y_col,
+    cell_type_col,
+    region_col,
+    region_val,
+    num_iterations,
 ):
     """
-    Iterate over triangulation distances for each unique region in the input dataframe.
+    Process multiple iterations of permutation for a given region.
+
+    This helper function takes a subset of the data and precomputed triangulation edges
+    and performs a series of iterations where cell type annotations are shuffled and the
+    mean distances are computed for each permutation.
 
     Parameters
     ----------
-    df_input : pandas.DataFrame
-        Input dataframe containing cell information.
-    id : str
-        Column name for cell id.
-    x_pos : str
-        Column name for x position of cells.
-    y_pos : str
-        Column name for y position of cells.
-    cell_type : str
-        Column name for cell type.
-    region : str
-        Column name for region.
-    num_cores : int, optional
-        Number of cores to use for parallel processing. If None, defaults to half of available cores.
-    num_iterations : int, optional
-        Number of iterations to perform. Defaults to 1000.
+    subset : pandas.DataFrame
+        DataFrame containing a subset of cell data for a single region.
+    edges_df : pandas.DataFrame
+        Precomputed triangulation edges for the subset.
+    id_col : str
+        Column name for cell identifiers.
+    x_col : str
+        Column name for the x-coordinate.
+    y_col : str
+        Column name for the y-coordinate.
+    cell_type_col : str
+        Column name for cell type or annotation to be shuffled.
+    region_col : str
+        Column name for region information.
+    region_val : str
+        The specific region value being processed.
+    num_iterations : int
+        Number of permutation iterations to perform.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with iterative triangulation distances for each unique region.
+        A DataFrame concatenating the mean distance summaries for each iteration.
+    """
+    results_list = []
+    for iteration in range(1, num_iterations + 1):
+        shuffled = shuffle_annotations(subset, cell_type_col, region_col, iteration)
+        annotated_df = annotate_triangulation_vectorized(
+            edges_df, shuffled, id_col, x_col, y_col, "random_annotations", region_col
+        )
+        per_cell_summary = (
+            annotated_df.groupby(["celltype1_index", "celltype1", "celltype2"])
+            .distance.mean()
+            .reset_index(name="per_cell_mean_dist")
+        )
+        per_celltype_summary = (
+            per_cell_summary.groupby(["celltype1", "celltype2"])
+            .per_cell_mean_dist.mean()
+            .reset_index(name="mean_dist")
+        )
+        per_celltype_summary[region_col] = region_val
+        per_celltype_summary["iteration"] = iteration
+        results_list.append(per_celltype_summary)
+    return pd.concat(results_list, ignore_index=True)
+
+
+def tl_iterate_tri_distances(
+    df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, num_iterations=1000
+):
+    """
+    Perform iterative permutation analysis for triangulation distances.
+
+    This function iterates over each unique region to calculate permutation-based triangulation
+    distance summaries using precomputed edges. It applies parallel processing to perform
+    multiple iterations efficiently.
+
+    Parameters
+    ----------
+    df_input : pandas.DataFrame
+        DataFrame containing the cell information.
+    id : str
+        Column name for cell identifiers.
+    x_pos : str
+        Column name for the x-coordinate.
+    y_pos : str
+        Column name for the y-coordinate.
+    cell_type : str
+        Column name for cell type information.
+    region : str
+        Column name for region information.
+    num_cores : int, optional
+        Number of CPU cores to use for parallelization. Defaults to half of os.cpu_count() if None.
+    num_iterations : int, optional
+        Number of permutation iterations to perform. Defaults to 1000.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A concatenated DataFrame with permutation-based mean distances for each region.
     """
     unique_regions = df_input[region].unique()
-    # Use only the necessary columns
     df_input = df_input[[id, x_pos, y_pos, cell_type, region]]
 
-    if num_cores is None:
-        num_cores = os.cpu_count() // 2  # Default to using half of available cores
-
-    # Define a helper function to process each region and iteration
-    def process_iteration(region_name, iteration):
-        # Filter by region
-        subset = df_input[df_input[region] == region_name].copy()
-        # Create unique IDs
-        subset.loc[:, "uniqueID"] = (
+    # Precompute triangulation edges for each region
+    region2df = {}
+    region2edges_df = {}
+    for reg_name in unique_regions:
+        subset = df_input[df_input[region] == reg_name].copy()
+        subset["uniqueID"] = (
             subset[id].astype(str)
             + "-"
             + subset[x_pos].astype(str)
             + "-"
             + subset[y_pos].astype(str)
         )
-        subset.loc[:, "XYcellID"] = (
-            subset[x_pos].astype(str) + "_" + subset[y_pos].astype(str)
+        subset["XYcellID"] = subset[x_pos].astype(str) + "_" + subset[y_pos].astype(str)
+        edges_df = compute_triangulation_edges(subset, x_pos, y_pos)
+        region2df[reg_name] = subset
+        region2edges_df[reg_name] = edges_df
+
+    def process_one_region(r):
+        subset = region2df[r]
+        edges_df = region2edges_df[r]
+        return _process_region_iterations(
+            subset, edges_df, id, x_pos, y_pos, cell_type, region, r, num_iterations
         )
 
-        # Shuffle annotations
-        shuffled = shuffle_annotations(subset, cell_type, region, iteration)
-
-        # Get triangulation distances
-        results = get_triangulation_distances(
-            df_input=shuffled,
-            id=id,
-            x_pos=x_pos,
-            y_pos=y_pos,
-            cell_type="random_annotations",
-            region=region,
-            num_cores=num_cores,
-            correct_dtype=False,
-            nested=True,
-        )
-
-        # Summarize results
-        per_cell_summary = (
-            results.groupby(["celltype1_index", "celltype1", "celltype2"])
-            .distance.mean()
-            .reset_index(name="per_cell_mean_dist")
-        )
-
-        per_celltype_summary = (
-            per_cell_summary.groupby(["celltype1", "celltype2"])
-            .per_cell_mean_dist.mean()
-            .reset_index(name="mean_dist")
-        )
-        per_celltype_summary[region] = region_name
-        per_celltype_summary["iteration"] = iteration
-
-        return per_celltype_summary
-
-    # TODO: remove nans valid here a good idea (attempt to fix windows unpickle issue)?
-    unique_regions = [r for r in unique_regions if r != np.nan]
-
-    # Parallel processing for each region and iteration
-    results = Parallel(n_jobs=num_cores)(
-        delayed(process_iteration)(region_name, iteration)
-        for region_name in unique_regions
-        for iteration in range(1, num_iterations + 1)
-    )
-
-    # Combine all results
-    iterative_triangulation_distances = pd.concat(results, ignore_index=True)
-    # iterative_triangulation_distances = iterative_triangulation_distances.dropna()
+    results_per_region = Parallel(
+        n_jobs=num_cores if num_cores is not None else os.cpu_count() // 2
+    )(delayed(process_one_region)(r) for r in unique_regions)
+    iterative_triangulation_distances = pd.concat(results_per_region, ignore_index=True)
     return iterative_triangulation_distances
 
 
@@ -1186,63 +1288,62 @@ def add_missing_columns(
     triangulation_distances, metadata, shared_column="unique_region"
 ):
     """
-    Add missing columns from metadata to triangulation_distances dataframe.
+    Add missing metadata columns to the triangulation distances DataFrame.
+
+    This function compares the metadata DataFrame with the triangulation distances DataFrame
+    and adds any columns from the metadata that are not present. It uses the shared_column
+    to map values and fills any missing values with "Unknown".
 
     Parameters
     ----------
     triangulation_distances : pandas.DataFrame
-        DataFrame containing triangulation distances.
+        DataFrame containing triangulation distances and possibly missing metadata columns.
     metadata : pandas.DataFrame
-        DataFrame containing metadata.
+        DataFrame containing additional metadata including the shared column.
     shared_column : str, optional
-        Column name that is shared between the two dataframes. Defaults to "unique_region".
+        Column name that is common to both DataFrames, by default "unique_region".
 
     Returns
     -------
     pandas.DataFrame
-        Updated triangulation_distances dataframe with missing columns added.
+        The updated triangulation distances DataFrame with added metadata columns.
     """
-    # Find the difference in columns
     missing_columns = set(metadata.columns) - set(triangulation_distances.columns)
-    # Add missing columns to triangulation_distances with NaN values
     for column in missing_columns:
         triangulation_distances[column] = pd.NA
-        # Create a mapping from unique_region to tissue in metadata
         region_to_tissue = pd.Series(
             metadata[column].values, index=metadata["unique_region"]
         ).to_dict()
-
-        # Apply this mapping to the triangulation_distances dataframe to create/update the tissue column
         triangulation_distances[column] = triangulation_distances["unique_region"].map(
             region_to_tissue
         )
-
-        # Handle regions with no corresponding tissue in the metadata by filling in a default value
         triangulation_distances[column].fillna("Unknown", inplace=True)
     return triangulation_distances
 
 
-# Calculate p-values and log fold differences
 def calculate_pvalue(row):
     """
     Calculate the p-value using the Mann-Whitney U test.
 
+    For a given row containing expected and observed lists of distances, this function
+    computes the p-value from the Mann-Whitney U test comparing the two distributions.
+    If the test fails, a NaN is returned.
+
     Parameters
     ----------
     row : pandas.Series
-        A row of data containing 'expected' and 'observed' values.
+        A row containing "expected" and "observed" distance lists.
 
     Returns
     -------
     float
-        The calculated p-value. Returns np.nan if there is insufficient data to perform the test.
+        The p-value computed from the Mann-Whitney U test, or NaN if computation fails.
     """
-    # function body here
     try:
         return st.mannwhitneyu(
             row["expected"], row["observed"], alternative="two-sided"
         ).pvalue
-    except ValueError:  # This handles cases with insufficient data
+    except ValueError:
         return np.nan
 
 
@@ -1263,45 +1364,51 @@ def identify_interactions(
     aggregate_per_cell=True,
 ):
     """
-    Identify interactions between cell types based on their spatial distances.
+    Identify significant cell-cell interactions based on spatial distances.
+
+    This function processes the input annotated data (adata) to compute observed triangulation
+    distances and perform permutation testing to generate expected distances. It then compares
+    the observed with expected mean distances using the Mann-Whitney U test to compute a p-value
+    and a log-fold change for each pair of cell types. The results are stored back in the adata
+    object and returned.
 
     Parameters
     ----------
     adata : AnnData
-        Annotated data matrix.
-    id : str
-        Identifier for cells.
+        Annotated data object that holds cell observation data (adata.obs).
+    cellid : str
+        Column name to be used as the unique cell identifier.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     comparison : str
-        Column name for comparison.
-    iTriDist_keyname : str, optional
-        Key name for iterative triangulation distances, by default None
-    triDist_keyname : str, optional
-        Key name for triangulation distances, by default None
+        Column name used to compare different conditions.
     min_observed : int, optional
-        Minimum number of observed distances, by default 10
+        Minimum number of observed distance measurements required to consider a significant interaction (default: 10).
     distance_threshold : int, optional
-        Threshold for distance, by default 128
+        Maximum distance to consider when grouping cell interactions (default: 128).
     num_cores : int, optional
-        Number of cores to use for computation, by default None
+        Number of CPU cores to use for parallel processing. Defaults to half of available cores if None.
     num_iterations : int, optional
-        Number of iterations for computation, by default 1000
+        The number of permutation iterations for generating expected distances (default: 1000).
     key_name : str, optional
-        Key name for output, by default None
+        Key under which the triangulation distances will be stored in adata.uns. If None, defaults to "triDist".
     correct_dtype : bool, optional
-        Whether to correct data type or not, by default False
+        Flag to convert coordinate and region columns to string types (default: False).
+    aggregate_per_cell : bool, optional
+        Whether to aggregate distances initially at a per-cell basis (default: True).
 
     Returns
     -------
-    DataFrame
-        DataFrame with p-values and logfold changes for interactions.
+    tuple
+        A tuple containing:
+            - distance_pvals (pandas.DataFrame): DataFrame with p-values and log-fold changes for each pair of cell types.
+            - triangulation_distances_dict (dict): Dictionary containing observed and iterated triangulation distance DataFrames.
     """
     df_input = pd.DataFrame(adata.obs)
     if cellid in df_input.columns:
@@ -1310,7 +1417,6 @@ def identify_interactions(
         print(cellid + " is not in the adata.obs, use index as cellid instead!")
         df_input[cellid] = df_input.index
 
-    # change columns to pandas string
     df_input[cell_type] = df_input[cell_type].astype(str)
     df_input[region] = df_input[region].astype(str)
 
@@ -1327,6 +1433,8 @@ def identify_interactions(
     )
     if key_name is None:
         triDist_keyname = "triDist"
+    else:
+        triDist_keyname = key_name
     adata.uns[triDist_keyname] = triangulation_distances
     print("Save triangulation distances output to anndata.uns " + triDist_keyname)
 
@@ -1348,7 +1456,7 @@ def identify_interactions(
     triangulation_distances_long = add_missing_columns(
         triangulation_distances, metadata, shared_column=region
     )
-    if aggregate_per_cell == True:
+    if aggregate_per_cell:
         observed_distances = (
             triangulation_distances_long.query("distance <= @distance_threshold")
             .groupby(["celltype1_index", "celltype1", "celltype2", comparison, region])
@@ -1396,7 +1504,6 @@ def identify_interactions(
         .reset_index()
     )
 
-    # Drop comparisons with low numbers of observations
     observed_distances["keep"] = observed_distances["observed"].apply(
         lambda x: len(x) > min_observed
     )
@@ -1407,11 +1514,9 @@ def identify_interactions(
     )
     expected_distances = expected_distances[expected_distances["keep"]]
 
-    # concatenate observed and expected distances
     distance_pvals = expected_distances.merge(
         observed_distances, on=["celltype1", "celltype2", comparison], how="left"
     )
-
     distance_pvals["pvalue"] = distance_pvals.apply(calculate_pvalue, axis=1)
     distance_pvals["logfold_group"] = np.log2(
         distance_pvals["observed_mean"] / distance_pvals["expected_mean"]
@@ -1420,12 +1525,7 @@ def identify_interactions(
         distance_pvals["celltype1"] + " --> " + distance_pvals["celltype2"]
     )
 
-    # drop na from distance_pvals
-    # distance_pvals = distance_pvals.dropna()
-
-    # append result to adata
-
-    # create dictionary for the results
+    # Collect final results
     triangulation_distances_dict = {
         "distance_pvals": distance_pvals,
         "triangulation_distances_observed": iterated_triangulation_distances_long,

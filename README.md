@@ -63,9 +63,8 @@ SPACEc GPU
 
 1. For GPU-accelerated clustering via RAPIDS, note that only RTX20XX or better GPUs are supported (optional).
 ```bash
-    conda install -c rapidsai -c conda-forge -c nvidia rapids=24.02
-    pip install rapids-singlecell==0.9.5 pandas==1.5
-    pip install --ignore-installed networkx==3.2
+    pip install 'rapids-singlecell[rapids11]' --extra-index-url=https://pypi.nvidia.com #CUDA11.X
+    pip install 'rapids-singlecell[rapids12]' --extra-index-url=https://pypi.nvidia.com #CUDA12
 ```
 
 2. To run STELLAR (optional).

@@ -61,10 +61,10 @@ SPACEc GPU
     conda activate spacec
 ```
 
-1. For GPU-accelerated clustering via RAPIDS, note that only RTX20XX or better GPUs are supported (optional).
+1. For GPU-accelerated clustering via RAPIDS, note that only RTX20XX or better GPUs are supported (optional). More information on rapids-singlecell are available here: https://rapids-singlecell.readthedocs.io/en/latest/Installation.html
 ```bash
     pip install 'rapids-singlecell[rapids11]' --extra-index-url=https://pypi.nvidia.com #CUDA11.X
-    pip install 'rapids-singlecell[rapids12]' --extra-index-url=https://pypi.nvidia.com #CUDA12
+    # pip install 'rapids-singlecell[rapids12]' --extra-index-url=https://pypi.nvidia.com #CUDA12
 ```
 
 2. To run STELLAR (optional).

@@ -2072,7 +2072,12 @@ def patch_proximity_analysis(
             if plot:
                 df_filtered = df_community[df_community["cluster"] != -1]
                 fig, ax = plt.subplots(figsize=(10, 10))
-                ax.scatter(df_filtered["x"], df_filtered["y"], c=plot_color, alpha=0.5)
+                ax.scatter(
+                    df_filtered[x_column],
+                    df_filtered[y_column],
+                    c=plot_color,
+                    alpha=0.5,
+                )
                 ax.set_title(f"HDBSCAN Clusters for {region}_{group}")
                 ax.set_xlabel(x_column)
                 ax.set_ylabel(y_column)

@@ -268,7 +268,7 @@ def clustering(
     n_neighbors : int, optional
         The number of neighbors to use for the neighbors graph. Defaults to 10.
     reclustering : bool, optional
-        Whether to recluster the data. Defaults to False.
+        If set to True, the function will skip the calculation of neighbors and UMAP. This can be used to speed up the process when just reclustering or running flowSOM.
     key_added : str, optional
         The key name to add to the adata object. Defaults to None.
     key_filter : str, optional

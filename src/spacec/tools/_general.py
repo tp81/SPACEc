@@ -2125,7 +2125,7 @@ def patch_proximity_analysis(
     final_results["unique_patch_ID"] = (
         final_results[region_column]
         + "_"
-        + final_results[patch_column]
+        + final_results[patch_column].astype(str)
         + "_"
         + "patch_no_"
         + final_results["patch_id"].astype(str)

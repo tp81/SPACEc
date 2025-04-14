@@ -2815,7 +2815,7 @@ def catplot(
     sns.set_style(style)
     if subset is None:
         region_list = list(
-            df[unique_region].unique().sort_values()
+            pd.Series(df[unique_region].unique()).sort_values()
         )  # display all experiments
     else:
         if subset not in list(df[unique_region].unique().sort_values()):

@@ -4320,6 +4320,7 @@ def BC_projection(
     else:
         plt.show()
 
+
 def distance_graph(
     dist_table,
     distance_pvals,
@@ -4824,6 +4825,7 @@ def create_mask_dict_png(mask_file_paths, region_names):
 
     return mask_dict
 
+
 def ppa_res_donut(
     adata,
     cat_col,
@@ -4951,33 +4953,34 @@ def ppa_res_donut(
       distance values. The innermost ring corresponds to the smallest distance,
       and the outermost ring corresponds to the largest distance.
     """
+    import os
     import textwrap
+
     import matplotlib.pyplot as plt
     import numpy as np
-    import os
-    
+
     # Define helper function for color generation if using generate_random_colors
     def hf_generate_random_colors(n, rand_seed=1):
         """Generate random colors for n categories."""
         np.random.seed(rand_seed)
         return [plt.cm.tab20(i % 20) for i in range(n)]
-    
+
     # extract key from adata
     region_results = adata.uns[key_name]
-    
+
     # check if region_results is empty
     if region_results.shape[0] == 0:
         print(f"Key {key_name} is empty.")
         return
-    
+
     # check if distance_from_patch column exists
-    if 'distance_from_patch' not in region_results.columns:
+    if "distance_from_patch" not in region_results.columns:
         raise ValueError("distance_from_patch column not found in the dataframe")
-    
+
     # Check if cat_col exists in region_results
     if cat_col not in region_results.columns:
         raise ValueError(f"Column '{cat_col}' not found in region_results")
-    
+
     # generate reproducable colors if no palette is provided
     if palette is None:
         if cat_col + "_colors" not in adata.uns.keys():
@@ -5007,33 +5010,39 @@ def ppa_res_donut(
             region_results = region_results[
                 region_results[subset_column] == subset_condition
             ]
-    
+
     # If group_by is specified, create separate visualizations for each group
     if group_by is not None:
         if group_by not in region_results.columns:
-            raise ValueError(f"Group by column '{group_by}' not found in region_results")
-        
+            raise ValueError(
+                f"Group by column '{group_by}' not found in region_results"
+            )
+
         # Get unique values in the group_by column
         group_values = region_results[group_by].unique()
         figs = {}
-        
+
         # Create a figure for each group
         for group_val in group_values:
             print(f"Creating visualization for {group_by} = {group_val}")
             # Filter data for this group
             group_data = region_results[region_results[group_by] == group_val]
-            
+
             # Skip groups with no data
             if len(group_data) == 0:
                 print(f"No data for {group_by} = {group_val}, skipping")
                 continue
-            
+
             # Custom title including the group value
             group_title = f"{title} - {group_by}: {group_val}"
-            
+
             # Custom filename if saving
-            group_filename = f"{output_fname}_{group_by}_{group_val}" if output_fname else f"{group_by}_{group_val}"
-            
+            group_filename = (
+                f"{output_fname}_{group_by}_{group_val}"
+                if output_fname
+                else f"{group_by}_{group_val}"
+            )
+
             # Call this function recursively without group_by to avoid infinite recursion
             fig = ppa_res_donut(
                 adata=adata,
@@ -5055,16 +5064,16 @@ def ppa_res_donut(
                 output_fname=group_filename,
                 output_dir=output_dir,
             )
-            
+
             figs[group_val] = fig
-        
+
         return figs
-    
+
     # Extract unique distances from the dataframe
-    available_distances = sorted(region_results['distance_from_patch'].unique())
+    available_distances = sorted(region_results["distance_from_patch"].unique())
     if len(available_distances) == 0:
         raise ValueError("No distance values found in distance_from_patch column")
-    
+
     # plotting
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -5079,60 +5088,66 @@ def ppa_res_donut(
             plt.plot(
                 [-x_new, x_new], [-y_new, y_new], color="black", alpha=0.3, zorder=-1
             )
-    
+
     # Collect all categories to ensure consistent wedge ordering
     all_categories = region_results[cat_col].unique()
-    
+
     # Process each distance - START FROM SMALLEST (INNERMOST) TO LARGEST (OUTERMOST)
     for i, radius in enumerate(available_distances):  # Not reversed anymore
         # Filter data based on distance_mode
         if distance_mode == "within":
             # Include all cells within the radius
-            filtered_results = region_results[region_results['distance_from_patch'] <= radius]
+            filtered_results = region_results[
+                region_results["distance_from_patch"] <= radius
+            ]
         elif distance_mode == "between":
             # Include only cells between this radius and the next smaller one
             if i == 0:  # Smallest radius (innermost ring)
                 prev_radius = 0
             else:
-                prev_radius = available_distances[i-1]  # Previous (smaller) radius
-            
+                prev_radius = available_distances[i - 1]  # Previous (smaller) radius
+
             filtered_results = region_results[
-                (region_results['distance_from_patch'] <= radius) & 
-                (region_results['distance_from_patch'] > prev_radius)
+                (region_results["distance_from_patch"] <= radius)
+                & (region_results["distance_from_patch"] > prev_radius)
             ]
         else:
             raise ValueError("distance_mode must be 'within' or 'between'")
-        
+
         print(f"Radius {radius}: {filtered_results.shape[0]} cells")
-        
+
         if filtered_results.shape[0] > 0:
             # Calculate percentages for this specific radius
-            percentage_dict = filtered_results[cat_col].value_counts(normalize=True) * 100
-            
+            percentage_dict = (
+                filtered_results[cat_col].value_counts(normalize=True) * 100
+            )
+
             # Create list of values and colors in consistent order
             wedge_values = []
             wedge_colors = []
-            
+
             # For each possible category, get its percentage (or 0 if not present)
             for category in all_categories:
                 if category in percentage_dict.index:
                     wedge_values.append(percentage_dict[category])
                     if category not in palette:
-                        raise ValueError(f"No color provided for category {category} in the palette")
+                        raise ValueError(
+                            f"No color provided for category {category} in the palette"
+                        )
                     wedge_colors.append(palette[category])
-                    
+
             # Only draw if there are values to plot
             if wedge_values:
                 # Radius increases with distance - smallest at center, largest at outside
                 ring_radius = 0.5 + 0.1 * (i + 1)
-                
+
                 # Draw this ring's pie
                 ax.pie(
-                    wedge_values, 
-                    radius=ring_radius, 
+                    wedge_values,
+                    radius=ring_radius,
                     colors=wedge_colors,
                     startangle=90,  # Start at top
-                    wedgeprops=dict(width=0.1, edgecolor='w')  # Make it a ring
+                    wedgeprops=dict(width=0.1, edgecolor="w"),  # Make it a ring
                 )
 
     # add labels for each distance ring
@@ -5154,9 +5169,12 @@ def ppa_res_donut(
     # add a legend based on the colors and keys in palette
     # Only include categories that are present in the data
     present_categories = region_results[cat_col].unique()
-    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[key]) 
-              for key in present_categories if key in palette]
-    
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=palette[key])
+        for key in present_categories
+        if key in palette
+    ]
+
     plt.legend(
         handles,
         [cat for cat in present_categories if cat in palette],
@@ -5182,13 +5200,15 @@ def ppa_res_donut(
     )
 
     plt.title(title, size=24, y=0.96)
-    plt.axis('equal')  # Equal aspect ratio ensures circle looks round
+    plt.axis("equal")  # Equal aspect ratio ensures circle looks round
 
     if savefig is None:
         pass
     elif savefig:
-        plt.savefig(os.path.join(output_dir, f"{output_fname}.pdf"), bbox_inches="tight")
+        plt.savefig(
+            os.path.join(output_dir, f"{output_fname}.pdf"), bbox_inches="tight"
+        )
     else:
         plt.show()
-        
+
     return fig

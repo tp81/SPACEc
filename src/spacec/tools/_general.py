@@ -50,8 +50,10 @@ if platform.system() == "Windows":
 
 
 import argparse
+import json
 import pathlib
 import pickle
+import re
 import time
 from builtins import range
 from itertools import combinations
@@ -60,6 +62,8 @@ from typing import TYPE_CHECKING
 
 import anndata
 import concave_hull
+import geopandas as gpd
+import matplotlib.patheffects as PathEffects
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
@@ -77,12 +81,15 @@ import statsmodels.api as sm
 import tissuumaps.jupyter as tj
 import torch
 from concave_hull import concave_hull_indexes
+from descartes import PolygonPatch
 from joblib import Parallel, delayed
+from matplotlib.patches import Circle, Patch
 from pyFlowSOM import map_data_to_nodes, som
 from scipy import stats
 from scipy.spatial import Delaunay, KDTree, distance
 from scipy.spatial.distance import cdist
 from scipy.stats import pearsonr, spearmanr
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from skimage.io import imsave
 from skimage.segmentation import find_boundaries
 from sklearn.cluster import HDBSCAN, MiniBatchKMeans
@@ -94,14 +101,6 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.svm import SVC
 from tqdm import tqdm
 from yellowbrick.cluster import KElbowVisualizer
-from descartes import PolygonPatch
-import geopandas as gpd
-from shapely.geometry import Polygon, LineString, Point, MultiPolygon
-import re
-import json
-from matplotlib.patches import Patch
-from matplotlib.patches import Circle
-import matplotlib.patheffects as PathEffects
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -1682,6 +1681,7 @@ def remove_rare_cell_types(
 
     return distance_pvals
 
+
 def stellar_get_edge_index(
     pos, distance_thres, max_memory_usage=1.6e10, chunk_size=1000
 ):
@@ -2344,6 +2344,7 @@ def tm_viewer_catplot(
         )
 
     return csv_paths
+
 
 def install_gpu_leiden(CUDA="12"):
     """
@@ -3029,9 +3030,12 @@ def launch_interactive_clustering(adata=None, output_dir=None):
 
     return main_layout
 
+
 # Functions for PPA
 ## Adjust clustering parameter to get the desired number of clusters
-def apply_dbscan_clustering(df, min_samples=10, x_col='x', y_col='y', allow_single_cluster=True):
+def apply_dbscan_clustering(
+    df, min_samples=10, x_col="x", y_col="y", allow_single_cluster=True
+):
     """
     Apply DBSCAN clustering to a dataframe and update the cluster labels in the original dataframe.
     Parameters
@@ -3257,25 +3261,25 @@ def process_cluster(args, nbrs, unique_clusters):
     idxes = concave_hull_indexes(
         points[:, :2],
         length_threshold=concave_hull_length_threshold,
-        concavity = concavity
+        concavity=concavity,
     )
     # Get hull points from the DataFrame
     hull_points = pd.DataFrame(points[idxes], columns=["x", "y"])
     # Find nearest neighbors of hull points in the original DataFrame
     distances, indices = nbrs.kneighbors(hull_points[["x", "y"]])
     hull_nearest_neighbors = df.iloc[indices.flatten()]
-    
+
     # Convert radius to a list if it's a single value
     if not isinstance(radius, (list, tuple, np.ndarray)):
         radius_list = [radius]
     else:
         radius_list = radius
-    
+
     # Extract hull points coordinates
     hull_coords = hull_nearest_neighbors[["x", "y"]].values
     # Calculate distances from all points in full_df to all hull points
     distances = cdist(full_df[["x", "y"]].values, hull_coords)
-    
+
     # Process each radius
     all_prox_points = []
     for r in radius_list:
@@ -3295,26 +3299,38 @@ def process_cluster(args, nbrs, unique_clusters):
         # Add patch_id and distance_from_patch columns
         r_prox_points["patch_id"] = cluster
         r_prox_points["distance_from_patch"] = r
-        
+
         all_prox_points.append(r_prox_points)
-    
+
     # Combine results from all radii
     if all_prox_points:
         prox_points = pd.concat(all_prox_points, ignore_index=True)
         # If multiple radii were used, keep only the smallest distance for each point
         if len(radius_list) > 1:
-            prox_points = prox_points.sort_values('distance_from_patch').drop_duplicates(
-                subset=[col for col in prox_points.columns if col != 'distance_from_patch']
+            prox_points = prox_points.sort_values(
+                "distance_from_patch"
+            ).drop_duplicates(
+                subset=[
+                    col for col in prox_points.columns if col != "distance_from_patch"
+                ]
             )
     else:
         # Create empty DataFrame with appropriate columns
-        prox_points = pd.DataFrame(columns=full_df.columns.tolist() + ["patch_id", "distance_from_patch"])
-    
+        prox_points = pd.DataFrame(
+            columns=full_df.columns.tolist() + ["patch_id", "distance_from_patch"]
+        )
+
     return prox_points, hull_nearest_neighbors
 
 
-def identify_hull_points(df, cluster_column="cluster", x_col="x", y_col="y",
-                         concave_hull_length_threshold=50, concavity=2):
+def identify_hull_points(
+    df,
+    cluster_column="cluster",
+    x_col="x",
+    y_col="y",
+    concave_hull_length_threshold=50,
+    concavity=2,
+):
     """
     Identify hull points with improved performance.
 
@@ -3349,7 +3365,9 @@ def identify_hull_points(df, cluster_column="cluster", x_col="x", y_col="y",
         points = subset[[x_col, y_col]].values
         if len(points) < 3:
             continue
-        idxes = concave_hull_indexes(points, concavity=concavity, length_threshold=concave_hull_length_threshold)
+        idxes = concave_hull_indexes(
+            points, concavity=concavity, length_threshold=concave_hull_length_threshold
+        )
         hull_points = subset.iloc[idxes].reset_index(drop=True)
         hull_points["order"] = range(len(hull_points))
         hull_points["patch_id"] = cluster
@@ -3362,10 +3380,18 @@ def identify_hull_points(df, cluster_column="cluster", x_col="x", y_col="y",
     return hull.sort_values(by=["patch_id", "order"]).drop(columns="order")
 
 
-def convert_dataframe_to_geojson(df, output_dir, region_name=None, x="x", y="y",
-                                 sample_col=None, region_col="unique_region",
-                                 patch_col="patch_id", geojson_prefix="hull_coordinates",
-                                 save_geojson=True):
+def convert_dataframe_to_geojson(
+    df,
+    output_dir,
+    region_name=None,
+    x="x",
+    y="y",
+    sample_col=None,
+    region_col="unique_region",
+    patch_col="patch_id",
+    geojson_prefix="hull_coordinates",
+    save_geojson=True,
+):
     """
     Convert a DataFrame into GeoJSON format with optional saving to file.
 
@@ -3442,16 +3468,15 @@ def convert_dataframe_to_geojson(df, output_dir, region_name=None, x="x", y="y",
                 geojson_path = os.path.join(region_dir, filename)
                 with open(geojson_path, "w") as f:
                     json.dump(geojson_dict, f)
-            geojson_results.append({
-                "filename": filename,
-                "geojson": geojson_dict
-            })
+            geojson_results.append({"filename": filename, "geojson": geojson_dict})
         if skipped:
             print(f"Skipped {len(skipped)} clusters with insufficient points")
     return geojson_results
 
 
-def process_geojson_region(region_df, region, region_col, patch_col, x, y, sample_label="all"):
+def process_geojson_region(
+    region_df, region, region_col, patch_col, x, y, sample_label="all"
+):
     """
     Process a single region to generate GeoJSON features.
 
@@ -3498,8 +3523,12 @@ def process_geojson_region(region_df, region, region_col, patch_col, x, y, sampl
         feature = {
             "type": "Feature",
             "properties": {
-                "sample": int(sample_label) if str(sample_label).isdigit() else sample_label,
-                "region": int(region_label) if str(region_label).isdigit() else region_label,
+                "sample": (
+                    int(sample_label) if str(sample_label).isdigit() else sample_label
+                ),
+                "region": (
+                    int(region_label) if str(region_label).isdigit() else region_label
+                ),
                 "cluster": int(cluster) if str(cluster).isdigit() else cluster,
             },
             "geometry": {
@@ -3534,7 +3563,9 @@ def extract_region_number(unique_region_value):
         return str(unique_region_value)
 
 
-def analyze_peripheral_cells(patches_gdf, codex_gdf, buffer_distances, original_unit_scale, tolerance_distance):
+def analyze_peripheral_cells(
+    patches_gdf, codex_gdf, buffer_distances, original_unit_scale, tolerance_distance
+):
     """
     Analyze peripheral cells with parallel processing.
 
@@ -3560,22 +3591,30 @@ def analyze_peripheral_cells(patches_gdf, codex_gdf, buffer_distances, original_
     """
     region_tasks = []
     for region_name, region_patches in patches_gdf.groupby("region_numeric"):
-        region_codex_cells = codex_gdf[codex_gdf["unique_region_numeric"] == region_name]
+        region_codex_cells = codex_gdf[
+            codex_gdf["unique_region_numeric"] == region_name
+        ]
         if len(region_codex_cells) > 0:
-            region_tasks.append((
-                region_name,
-                region_patches,
-                region_codex_cells,
-                buffer_distances,
-                original_unit_scale,
-                tolerance_distance,
-            ))
+            region_tasks.append(
+                (
+                    region_name,
+                    region_patches,
+                    region_codex_cells,
+                    buffer_distances,
+                    original_unit_scale,
+                    tolerance_distance,
+                )
+            )
     results = {dist: [] for dist in buffer_distances}
     buffer_geometries = {dist: [] for dist in buffer_distances}
     max_workers = min(os.cpu_count(), len(region_tasks))
     if max_workers > 1:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            for region_name, region_results, region_buffers in executor.map(process_region_peripheral_cells, region_tasks):
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            for region_name, region_results, region_buffers in executor.map(
+                process_region_peripheral_cells, region_tasks
+            ):
                 for dist, df in region_results.items():
                     if not df.empty:
                         results[dist].append(df)
@@ -3583,7 +3622,9 @@ def analyze_peripheral_cells(patches_gdf, codex_gdf, buffer_distances, original_
                     buffer_geometries[dist].extend(buffers)
     else:
         for task in region_tasks:
-            region_name, region_results, region_buffers = process_region_peripheral_cells(task)
+            region_name, region_results, region_buffers = (
+                process_region_peripheral_cells(task)
+            )
             for dist, df in region_results.items():
                 if not df.empty:
                     results[dist].append(df)
@@ -3631,14 +3672,16 @@ def save_peripheral_cells(results, unit_name, region_name, output_dir, save_csv=
         if save_csv:
             peripheral_path = os.path.join(
                 region_dir,
-                f"{unit_name}_region_{region_name}_peripheral_cells_{dist}um.csv"
+                f"{unit_name}_region_{region_name}_peripheral_cells_{dist}um.csv",
             )
             data.to_csv(peripheral_path, index=False)
-    combined_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+    combined_df = (
+        pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+    )
     if save_csv and not combined_df.empty:
         combined_path = os.path.join(
             region_dir,
-            f"{unit_name}_region_{region_name}_peripheral_cells_combined.csv"
+            f"{unit_name}_region_{region_name}_peripheral_cells_combined.csv",
         )
         combined_df.to_csv(combined_path, index=False)
     return combined_df
@@ -3675,8 +3718,14 @@ def process_region_peripheral_cells(args):
         - buffer_geometries : dict
           Dictionary with buffer geometry information.
     """
-    (region_name, region_patches, region_codex_cells,
-     buffer_distances, original_unit_scale, tolerance_distance) = args
+    (
+        region_name,
+        region_patches,
+        region_codex_cells,
+        buffer_distances,
+        original_unit_scale,
+        tolerance_distance,
+    ) = args
     region_codex_cells_sindex = region_codex_cells.sindex
     results = {dist: [] for dist in buffer_distances}
     buffer_geometries = {dist: [] for dist in buffer_distances}
@@ -3687,15 +3736,21 @@ def process_region_peripheral_cells(args):
         for dist in buffer_distances:
             scaled_dist = dist / original_unit_scale
             expanded_patch = patch_polygon.buffer(scaled_dist)
-            peripheral_region = expanded_patch.difference(patch_polygon).buffer(tolerance_distance)
-            buffer_geometries[dist].append({
-                "patch_id": patch_id,
-                "cluster": cluster_label,
-                "original": patch_polygon,
-                "expanded": expanded_patch,
-                "peripheral": peripheral_region
-            })
-            possible_matches_idx = list(region_codex_cells_sindex.intersection(peripheral_region.bounds))
+            peripheral_region = expanded_patch.difference(patch_polygon).buffer(
+                tolerance_distance
+            )
+            buffer_geometries[dist].append(
+                {
+                    "patch_id": patch_id,
+                    "cluster": cluster_label,
+                    "original": patch_polygon,
+                    "expanded": expanded_patch,
+                    "peripheral": peripheral_region,
+                }
+            )
+            possible_matches_idx = list(
+                region_codex_cells_sindex.intersection(peripheral_region.bounds)
+            )
             possible_matches = region_codex_cells.iloc[possible_matches_idx]
             mask = possible_matches.geometry.within(peripheral_region)
             peripheral_cells = possible_matches[mask].copy()
@@ -3724,7 +3779,7 @@ def extract_unit_name(geojson):
     -------
     str
         The extracted unit name.
-    
+
     Raises
     ------
     ValueError
@@ -3739,8 +3794,9 @@ def extract_unit_name(geojson):
     file_name_no_ext = os.path.splitext(file_name)[0]
     parts = file_name_no_ext.split("_")
     if "ppa" in parts:
-        return "_".join(parts[:parts.index("ppa")])
+        return "_".join(parts[: parts.index("ppa")])
     return file_name_no_ext
+
 
 def patch_proximity_analysis(
     adata,
@@ -3756,12 +3812,12 @@ def patch_proximity_analysis(
     savefig=False,
     output_dir="./",
     output_fname="",
-    save_geojson = True,
+    save_geojson=True,
     allow_single_cluster=True,
-    method = "border_cell_radius",
+    method="border_cell_radius",
     concave_hull_length_threshold=50,
     concavity=2,
-    original_unit_scale = 1,
+    original_unit_scale=1,
     tolerance_distance=0.001,
     key_name=None,
 ):
@@ -3769,26 +3825,26 @@ def patch_proximity_analysis(
     Performs a proximity analysis on patches of a given group within each region of a dataset.
 
     This function processes an AnnData object by extracting its cell observations and performing
-    proximity analysis on a specified cell group (e.g. a cell type or neighborhood) within each 
-    region. Depending on the chosen method ("border_cell_radius" or "hull_expansion"), the analysis 
-    applies DBSCAN clustering, identifies concave hull boundaries, and then either determines nearby 
-    cells based on a fixed search radius or uses a peripheral buffering approach. Optionally, the 
+    proximity analysis on a specified cell group (e.g. a cell type or neighborhood) within each
+    region. Depending on the chosen method ("border_cell_radius" or "hull_expansion"), the analysis
+    applies DBSCAN clustering, identifies concave hull boundaries, and then either determines nearby
+    cells based on a fixed search radius or uses a peripheral buffering approach. Optionally, the
     function can plot visualization of the analysis and save outputs (figures, CSV files, and GeoJSON).
 
     Parameters
     ----------
     adata : AnnData
-        The annotated data matrix of shape (n_obs x n_vars). Rows correspond to individual cells 
+        The annotated data matrix of shape (n_obs x n_vars). Rows correspond to individual cells
         and columns to gene expression or other features.
     region_column : str
         The name of the column in adata.obs that contains region information.
     patch_column : str
         The name of the column in adata.obs that contains patch (or group) information.
     group : str
-        The specific group (e.g. cell type or patch identifier) on which the proximity analysis 
+        The specific group (e.g. cell type or patch identifier) on which the proximity analysis
         is to be performed.
     min_cluster_size : int, optional
-        The minimum number of cells required in a region to perform the analysis. Regions with fewer 
+        The minimum number of cells required in a region to perform the analysis. Regions with fewer
         cells than this value will be skipped. Default is 80.
     x_column : str, optional
         The column name in adata.obs corresponding to the x-coordinate of each cell. Default is "x".
@@ -3811,33 +3867,33 @@ def patch_proximity_analysis(
     save_geojson : bool, optional
         Whether to convert certain results to GeoJSON format and save them. Default is True.
     allow_single_cluster : bool, optional
-        If True, allows DBSCAN to assign all cells to a single cluster even if no separate clusters 
+        If True, allows DBSCAN to assign all cells to a single cluster even if no separate clusters
         exist. Default is True.
     method : str, optional
-        The analysis method to use. Options are "border_cell_radius" (default) or "hull_expansion". 
+        The analysis method to use. Options are "border_cell_radius" (default) or "hull_expansion".
         Each method applies a different strategy for proximity detection.
     concave_hull_length_threshold : int, optional
         Threshold value used for generating the concave hull boundary. Default is 50.
     concavity : int, optional
         Parameter specifying the degree of concavity when calculating the hull boundary. Default is 2.
     original_unit_scale : int or float, optional
-        A scaling factor to convert the radius from its given unit to the coordinate system unit. 
+        A scaling factor to convert the radius from its given unit to the coordinate system unit.
         Default is 1.
     tolerance_distance : float, optional
-        Tolerance value for buffering in the peripheral analysis (used when method is "hull_expansion"). 
+        Tolerance value for buffering in the peripheral analysis (used when method is "hull_expansion").
         Default is 0.001.
     key_name : str, optional
-        The key under which the final proximity analysis results are stored in adata.uns. If not 
+        The key under which the final proximity analysis results are stored in adata.uns. If not
         provided, defaults to "ppa_result".
 
     Returns
     -------
     final_results : pandas.DataFrame
         A DataFrame containing the combined proximity analysis results from all processed regions.
-        It includes, among other information, a newly generated "unique_patch_ID" column that 
+        It includes, among other information, a newly generated "unique_patch_ID" column that
         concatenates the region, group, and patch identifier.
     outlines_results : pandas.DataFrame
-        A DataFrame containing the outline (or hull) points corresponding to the patches; useful for 
+        A DataFrame containing the outline (or hull) points corresponding to the patches; useful for
         visualization or further spatial analysis.
     """
     # multiply radius by original_unit_scale
@@ -3845,18 +3901,18 @@ def patch_proximity_analysis(
         radius = [r * original_unit_scale for r in radius]
     else:
         radius = radius * original_unit_scale
-    
+
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-    
+
     distance_from_patch = radius
     # make list
     if isinstance(distance_from_patch, int):
         distance_from_patch = [distance_from_patch]
-    
+
     # Get data from adata
     df = adata.obs
-    
+
     # Check if the required columns are present in the DataFrame
     if region_column not in df.columns:
         raise ValueError(f"Column '{region_column}' not found in adata.obs")
@@ -3864,8 +3920,8 @@ def patch_proximity_analysis(
         raise ValueError(f"Column '{patch_column}' not found in adata.obs")
     if group not in df[patch_column].unique():
         raise ValueError(f"Group '{group}' not found in column '{patch_column}'")
-    
-    # Convert categorical columns to string once   
+
+    # Convert categorical columns to string once
     for col in df.select_dtypes(["category"]).columns:
         df[col] = df[col].astype(str)
 
@@ -3881,15 +3937,21 @@ def patch_proximity_analysis(
         # Check if region is large enough
         if df_community.shape[0] < min_cluster_size:
             print(f"No {group} in {region}")
-            continue   
+            continue
         else:
             print(f"Processing {region}_{group}")
             # Create region directory
             if save_geojson or (plot and savefig):
                 region_dir = os.path.join(output_dir, f"region_{region}")
                 os.makedirs(region_dir, exist_ok=True)
-            
-            apply_dbscan_clustering(df_community, min_samples=min_cluster_size, x_col=x_column, y_col=y_column, allow_single_cluster=allow_single_cluster)
+
+            apply_dbscan_clustering(
+                df_community,
+                min_samples=min_cluster_size,
+                x_col=x_column,
+                y_col=y_column,
+                allow_single_cluster=allow_single_cluster,
+            )
 
             # Identify hull points
             hull = identify_hull_points(
@@ -3904,7 +3966,7 @@ def patch_proximity_analysis(
             if hull.empty:
                 print(f"No clusters found for region {region}.")
                 continue
-            
+
             if method == "border_cell_radius":
                 results, hull_nearest_neighbors = identify_points_in_proximity(
                     df=df_community,
@@ -3920,9 +3982,9 @@ def patch_proximity_analysis(
                     concavity=concavity,
                 )
 
-                # add hull_nearest_neighbors to list                
+                # add hull_nearest_neighbors to list
                 outlines.append(hull_nearest_neighbors)
-                
+
                 # Convert to GeoJSON
                 if save_geojson:
                     geojson_results = convert_dataframe_to_geojson(
@@ -3931,11 +3993,11 @@ def patch_proximity_analysis(
                         region_name=region,
                         x=x_column,
                         y=y_column,
-                        region_col='unique_region',
-                        patch_col='patch_id',
-                        save_geojson=save_geojson
+                        region_col="unique_region",
+                        patch_col="patch_id",
+                        save_geojson=save_geojson,
                     )
-                    
+
                 # Create visualizations for border_cell_radius method
                 if plot:
                     try:
@@ -3951,29 +4013,33 @@ def patch_proximity_analysis(
                             radius=radius,
                             hull_points=hull,
                             proximity_results=results,
-                            hull_neighbors=hull_nearest_neighbors
+                            hull_neighbors=hull_nearest_neighbors,
                         )
-                        
+
                         if savefig:
                             plot_path = os.path.join(
                                 region_dir if region_dir else output_dir,
-                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf"
+                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf",
                             )
                             # Save with higher quality and proper bounds
-                            fig.savefig(plot_path, bbox_inches="tight", dpi=300, format='pdf')
+                            fig.savefig(
+                                plot_path, bbox_inches="tight", dpi=300, format="pdf"
+                            )
                             print(f"Saved visualization to: {plot_path}")
                         else:
                             plt.show()
-                        
+
                         plt.close(fig)  # Ensure figure is closed to free memory
                     except Exception as e:
-                        print(f"Warning: Failed to create visualization for region {region}: {str(e)}")
-                
+                        print(
+                            f"Warning: Failed to create visualization for region {region}: {str(e)}"
+                        )
+
                 print(f"Finished {region}_{group}")
 
                 # append to region_results
                 region_results.append(results)
-                
+
             elif method == "hull_expansion":
                 geojson_results = convert_dataframe_to_geojson(
                     df=hull,
@@ -3981,53 +4047,69 @@ def patch_proximity_analysis(
                     region_name=region,
                     x=x_column,
                     y=y_column,
-                    region_col='unique_region',
-                    patch_col='patch_id',
-                    save_geojson=save_geojson
+                    region_col="unique_region",
+                    patch_col="patch_id",
+                    save_geojson=save_geojson,
                 )
-                
+
                 # Create GeoDataFrames once per region
-                patches_gdf = gpd.GeoDataFrame.from_features(geojson_results[0]["geojson"]["features"])
-                codex_points = gpd.points_from_xy(df_region[x_column], df_region[y_column])
+                patches_gdf = gpd.GeoDataFrame.from_features(
+                    geojson_results[0]["geojson"]["features"]
+                )
+                codex_points = gpd.points_from_xy(
+                    df_region[x_column], df_region[y_column]
+                )
                 codex_gdf = gpd.GeoDataFrame(df_region, geometry=codex_points)
                 codex_gdf.set_crs(patches_gdf.crs, inplace=True)
 
                 # Extract region numbers once
-                patches_gdf['region_numeric'] = patches_gdf['region'].apply(extract_region_number)
-                codex_gdf['unique_region_numeric'] = df_region[region_column].apply(extract_region_number)
-                
+                patches_gdf["region_numeric"] = patches_gdf["region"].apply(
+                    extract_region_number
+                )
+                codex_gdf["unique_region_numeric"] = df_region[region_column].apply(
+                    extract_region_number
+                )
+
                 # Run peripheral analysis with buffer geometries
                 buffer_results, buffer_geometries = analyze_peripheral_cells(
                     patches_gdf=patches_gdf,
                     codex_gdf=codex_gdf,
                     buffer_distances=distance_from_patch,
                     original_unit_scale=original_unit_scale,
-                    tolerance_distance=tolerance_distance
+                    tolerance_distance=tolerance_distance,
                 )
-                
+
                 # Save results
                 unit_name = extract_unit_name(geojson_results[0]["geojson"])
                 combined_df = save_peripheral_cells(
-                    results=buffer_results, 
-                    unit_name=unit_name, 
+                    results=buffer_results,
+                    unit_name=unit_name,
                     region_name=region,
                     output_dir=output_dir,
-                    save_csv=False
+                    save_csv=False,
                 )
-                
+
                 # rename dist to distance_from_patch
-                combined_df.rename(columns={"dist": "distance_from_patch"}, inplace=True)
-                
+                combined_df.rename(
+                    columns={"dist": "distance_from_patch"}, inplace=True
+                )
+
                 # remove column unique_region_numeric and buffer_distance
-                combined_df.drop(columns=["unique_region_numeric", "buffer_distance"], inplace=True, errors='ignore')
-                
+                combined_df.drop(
+                    columns=["unique_region_numeric", "buffer_distance"],
+                    inplace=True,
+                    errors="ignore",
+                )
+
                 # remove duplicates
-                combined_df = combined_df.drop_duplicates(subset=[x_column, y_column, "patch_id", "distance_from_patch"])
-                
+                combined_df = combined_df.drop_duplicates(
+                    subset=[x_column, y_column, "patch_id", "distance_from_patch"]
+                )
+
                 # append to region_results
                 region_results.append(combined_df)
                 outlines.append(hull)
-                
+
                 if plot:
                     try:
                         fig = create_visualization_hull_expansion(
@@ -4042,26 +4124,32 @@ def patch_proximity_analysis(
                             x_column=x_column,
                             y_column=y_column,
                             buffer_distances=distance_from_patch,
-                            original_unit_scale=original_unit_scale
+                            original_unit_scale=original_unit_scale,
                         )
-                        
+
                         if savefig:
                             plot_path = os.path.join(
                                 region_dir if region_dir else output_dir,
-                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf"
+                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf",
                             )
                             # Save with higher quality and proper bounds
-                            fig.savefig(plot_path, bbox_inches="tight", dpi=300, format='pdf')
+                            fig.savefig(
+                                plot_path, bbox_inches="tight", dpi=300, format="pdf"
+                            )
                             print(f"Saved visualization to: {plot_path}")
                         else:
                             plt.show()
-                        
+
                         plt.close(fig)  # Ensure figure is closed to free memory
                     except Exception as e:
-                        print(f"Warning: Failed to create visualization for region {region}: {str(e)}")
-                  
+                        print(
+                            f"Warning: Failed to create visualization for region {region}: {str(e)}"
+                        )
+
             else:
-                raise ValueError(f"Unknown method: {method}. Please choose either 'border_cell_radius' or 'hull_expansion'.")
+                raise ValueError(
+                    f"Unknown method: {method}. Please choose either 'border_cell_radius' or 'hull_expansion'."
+                )
 
     # Concatenate all results into a single DataFrame
     final_results = pd.concat(region_results)
@@ -4088,11 +4176,21 @@ def patch_proximity_analysis(
 
     return final_results, outlines_results
 
+
 def create_visualization_hull_expansion(
-    region, group, df_community, hull, patches_gdf, 
-    df_region, buffer_geometries, peripheral_results,
-    x_column, y_column, buffer_distances, original_unit_scale,
-    figsize=(20, 16)
+    region,
+    group,
+    df_community,
+    hull,
+    patches_gdf,
+    df_region,
+    buffer_geometries,
+    peripheral_results,
+    x_column,
+    y_column,
+    buffer_distances,
+    original_unit_scale,
+    figsize=(20, 16),
 ):
     """
     Create comprehensive visualization of the patch proximity analysis.
@@ -4142,255 +4240,323 @@ def create_visualization_hull_expansion(
     - Legends, annotations, and titles are added to convey clustering metrics and analysis steps.
     """
     # Filter to show only clustered points
-    df_filtered = df_community[df_community['cluster'] != -1]
-    
+    df_filtered = df_community[df_community["cluster"] != -1]
+
     # Create a colormap for clusters
-    unique_clusters = sorted(df_filtered['cluster'].unique())
+    unique_clusters = sorted(df_filtered["cluster"].unique())
     n_clusters = len(unique_clusters)
-    
+
     # Create a colorblind-friendly color palette for clusters
     cluster_colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_clusters)))
     cluster_cmap = mcolors.ListedColormap(cluster_colors[:n_clusters])
-    
+
     # Create buffer distance colors (using a different color scheme)
     buffer_colors = {
-        dist: plt.cm.plasma(i/len(buffer_distances)) 
+        dist: plt.cm.plasma(i / len(buffer_distances))
         for i, dist in enumerate(buffer_distances)
     }
-    
+
     # Calculate data bounds to maintain consistent view across all plots
     x_min = df_region[x_column].min()
     x_max = df_region[x_column].max()
     y_min = df_region[y_column].min()
     y_max = df_region[y_column].max()
-    
+
     # Add some padding to the bounds (5% on each side)
     x_padding = 0.05 * (x_max - x_min)
     y_padding = 0.05 * (y_max - y_min)
     x_bounds = [x_min - x_padding, x_max + x_padding]
     y_bounds = [y_min - y_padding, y_max + y_padding]
-    
+
     # Create figure with adequate spacing between subplots
     fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
     axes = axes.flatten()
-    
+
     # PANEL 1: Original clustering
     ax1 = axes[0]
     scatter1 = ax1.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered['cluster'], cmap=cluster_cmap, 
-        alpha=0.7, s=30, edgecolor='none'
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered["cluster"],
+        cmap=cluster_cmap,
+        alpha=0.7,
+        s=30,
+        edgecolor="none",
     )
-    
+
     # Add background points (all cells in region)
     ax1.scatter(
-        df_region[x_column], df_region[y_column], 
-        color='lightgray', alpha=0.3, s=10, label='All cells'
+        df_region[x_column],
+        df_region[y_column],
+        color="lightgray",
+        alpha=0.3,
+        s=10,
+        label="All cells",
     )
-    
+
     ax1.set_title(f"Clustering of {group} cells in Region {region}", fontsize=14)
     ax1.set_xlabel(x_column, fontsize=12)
     ax1.set_ylabel(y_column, fontsize=12)
     ax1.grid(alpha=0.3)
-    ax1.set_aspect('equal')  # Maintain aspect ratio
+    ax1.set_aspect("equal")  # Maintain aspect ratio
     ax1.set_xlim(x_bounds)
     ax1.set_ylim(y_bounds)
-    
+
     # Add legend for clusters in a good position
     if n_clusters <= 10:  # Only show legend for reasonable number of clusters
         legend1 = ax1.legend(
-            handles=[Patch(color=cluster_cmap(i), label=f'Cluster {cluster}') 
-                    for i, cluster in enumerate(unique_clusters)],
-            title="Clusters", loc="best", frameon=True, 
-            bbox_to_anchor=(1.02, 1), fontsize=10
+            handles=[
+                Patch(color=cluster_cmap(i), label=f"Cluster {cluster}")
+                for i, cluster in enumerate(unique_clusters)
+            ],
+            title="Clusters",
+            loc="best",
+            frameon=True,
+            bbox_to_anchor=(1.02, 1),
+            fontsize=10,
         )
         ax1.add_artist(legend1)
     else:
         # Just add a colorbar
         cbar = fig.colorbar(scatter1, ax=ax1, pad=0.01, shrink=0.8)
-        cbar.set_label('Cluster ID')
-    
+        cbar.set_label("Cluster ID")
+
     # Annotate with number of clusters using relative positioning
     # Position in the top-left with padding from the axes
     ax1.annotate(
         f"Number of clusters: {n_clusters}",
-        xy=(0.02, 0.98), xycoords='axes fraction',
-        fontsize=11, ha='left', va='top',
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
+        xy=(0.02, 0.98),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
     )
-    
+
     # PANEL 2: Hull points and polygons
     ax2 = axes[1]
-    
+
     # Plot original points with lower alpha
     ax2.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered['cluster'], cmap=cluster_cmap,
-        alpha=0.3, s=20
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered["cluster"],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
     )
-    
+
     # Plot hull points
     if not hull.empty:
         ax2.scatter(
-            hull[x_column], hull[y_column], 
-            color='red', s=50, label='Hull Points',
-            edgecolor='black', linewidth=1, alpha=0.8
+            hull[x_column],
+            hull[y_column],
+            color="red",
+            s=50,
+            label="Hull Points",
+            edgecolor="black",
+            linewidth=1,
+            alpha=0.8,
         )
-    
+
     # Plot the polygons from patches_gdf
     for idx, patch in patches_gdf.iterrows():
-        cluster_idx = unique_clusters.index(patch['cluster']) if patch['cluster'] in unique_clusters else 0
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
         color = cluster_cmap(cluster_idx)
-        
+
         # Plot the polygon boundary
         x, y = patch.geometry.exterior.xy
         ax2.plot(x, y, color=color, linewidth=2, alpha=0.9)
-        
+
         # Add label in center of polygon, with smart positioning
         # Use path effects to ensure visibility against any background
         centroid = patch.geometry.centroid
         txt = ax2.text(
-            centroid.x, centroid.y, f"C{patch['cluster']}", 
-            fontsize=10, ha='center', va='center', 
-            fontweight='bold', color='black'
+            centroid.x,
+            centroid.y,
+            f"C{patch['cluster']}",
+            fontsize=10,
+            ha="center",
+            va="center",
+            fontweight="bold",
+            color="black",
         )
-        txt.set_path_effects([
-            PathEffects.withStroke(linewidth=3, foreground='white')
-        ])
-    
+        txt.set_path_effects([PathEffects.withStroke(linewidth=3, foreground="white")])
+
     ax2.set_title("Hull Points and Resulting Polygons", fontsize=14)
     ax2.set_xlabel(x_column, fontsize=12)
     ax2.set_ylabel(y_column, fontsize=12)
     ax2.grid(alpha=0.3)
-    ax2.set_aspect('equal')  # Maintain aspect ratio
+    ax2.set_aspect("equal")  # Maintain aspect ratio
     ax2.set_xlim(x_bounds)
     ax2.set_ylim(y_bounds)
-    
+
     # Position the legend in a less crowded area
     ax2.legend(loc="best", bbox_to_anchor=(1.02, 1))
-    
+
     # PANEL 3: Buffer regions
     ax3 = axes[2]
-    
+
     # First plot all original polygons with light colors
     for idx, patch in patches_gdf.iterrows():
-        cluster_idx = unique_clusters.index(patch['cluster']) if patch['cluster'] in unique_clusters else 0
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
         color = cluster_cmap(cluster_idx)
-        
+
         # Plot the original polygon with a solid line
         x, y = patch.geometry.exterior.xy
         ax3.plot(x, y, color=color, linewidth=2, alpha=0.7)
-        
+
         # For each buffer distance, draw expanded polygons
         for dist_idx, dist in enumerate(buffer_distances):
             buffer_color = buffer_colors[dist]
-            
+
             # Find the corresponding buffer geometry
             for buffer_geom in buffer_geometries[dist]:
-                if buffer_geom['patch_id'] == idx:
+                if buffer_geom["patch_id"] == idx:
                     # Draw the expanded polygon with a dashed line
                     try:
-                        x, y = buffer_geom['expanded'].exterior.xy
+                        x, y = buffer_geom["expanded"].exterior.xy
                         ax3.plot(
-                            x, y, 
-                            color=buffer_color, 
-                            linewidth=1.5, 
-                            linestyle='--', 
+                            x,
+                            y,
+                            color=buffer_color,
+                            linewidth=1.5,
+                            linestyle="--",
                             alpha=0.7,
-                            label=f"{dist} unit buffer" if idx == list(patches_gdf.index)[0] and dist_idx == 0 else ""
+                            label=(
+                                f"{dist} unit buffer"
+                                if idx == list(patches_gdf.index)[0] and dist_idx == 0
+                                else ""
+                            ),
                         )
                     except:
                         # Handle MultiPolygons or other complex geometries
-                        if isinstance(buffer_geom['expanded'], MultiPolygon):
-                            for geom in buffer_geom['expanded'].geoms:
+                        if isinstance(buffer_geom["expanded"], MultiPolygon):
+                            for geom in buffer_geom["expanded"].geoms:
                                 x, y = geom.exterior.xy
-                                ax3.plot(x, y, color=buffer_color, linewidth=1.5, linestyle='--', alpha=0.7)
-    
+                                ax3.plot(
+                                    x,
+                                    y,
+                                    color=buffer_color,
+                                    linewidth=1.5,
+                                    linestyle="--",
+                                    alpha=0.7,
+                                )
+
     ax3.set_title("Buffer Zones Around Polygons", fontsize=14)
     ax3.set_xlabel(x_column, fontsize=12)
     ax3.set_ylabel(y_column, fontsize=12)
     ax3.grid(alpha=0.3)
-    ax3.set_aspect('equal')  # Maintain aspect ratio
+    ax3.set_aspect("equal")  # Maintain aspect ratio
     ax3.set_xlim(x_bounds)
     ax3.set_ylim(y_bounds)
-    
+
     # Create legend for buffer distances with custom positioning
     buffer_legend_handles = [
         Patch(color=buffer_colors[dist], alpha=0.7, label=f"{dist} unit buffer")
         for dist in buffer_distances
     ]
     ax3.legend(handles=buffer_legend_handles, loc="best", bbox_to_anchor=(1.02, 1))
-    
+
     # PANEL 4: Peripheral cells
     ax4 = axes[3]
-    
+
     # Plot original polygons
     for idx, patch in patches_gdf.iterrows():
-        cluster_idx = unique_clusters.index(patch['cluster']) if patch['cluster'] in unique_clusters else 0
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
         color = cluster_cmap(cluster_idx)
-        
+
         # Plot the polygon outline
         x, y = patch.geometry.exterior.xy
         ax4.plot(x, y, color=color, linewidth=2, alpha=0.7)
-    
+
     # Plot peripheral cells for each buffer distance
     for dist in buffer_distances:
         peripheral_cells = peripheral_results[dist]
         if peripheral_cells.empty:
             continue
-            
+
         # Plot cells with distinct markers for each buffer distance
-        markers = ['o', 's', '^', 'd', '*']  # circle, square, triangle, diamond, star
+        markers = ["o", "s", "^", "d", "*"]  # circle, square, triangle, diamond, star
         marker = markers[buffer_distances.index(dist) % len(markers)]
-        
+
         ax4.scatter(
-            peripheral_cells[x_column], peripheral_cells[y_column],
-            color=buffer_colors[dist], marker=marker, 
-            s=40, alpha=0.7, edgecolor='black', linewidth=0.5,
-            label=f"Peripheral cells ({dist} unit buffer)"
+            peripheral_cells[x_column],
+            peripheral_cells[y_column],
+            color=buffer_colors[dist],
+            marker=marker,
+            s=40,
+            alpha=0.7,
+            edgecolor="black",
+            linewidth=0.5,
+            label=f"Peripheral cells ({dist} unit buffer)",
         )
-    
+
     ax4.set_title("Detected Peripheral Cells by Buffer Distance", fontsize=14)
     ax4.set_xlabel(x_column, fontsize=12)
     ax4.set_ylabel(y_column, fontsize=12)
     ax4.grid(alpha=0.3)
-    ax4.set_aspect('equal')  # Maintain aspect ratio
+    ax4.set_aspect("equal")  # Maintain aspect ratio
     ax4.set_xlim(x_bounds)
     ax4.set_ylim(y_bounds)
-    
+
     # Position the legend outside the plot area if it might overlap with data
     ax4.legend(loc="best", bbox_to_anchor=(1.02, 1))
-    
+
     # Add overall title with enough space
     fig.suptitle(
-        f"Patch Proximity Analysis for {group} in Region {region}",
-        fontsize=18, y=0.98
+        f"Patch Proximity Analysis for {group} in Region {region}", fontsize=18, y=0.98
     )
-    
+
     # Add explanatory text at the bottom with enough padding
     # Position it well below the plots to avoid overlap
     explanation_text = (
         f"This analysis identifies clusters of {group} cells, creates boundary polygons, and detects "
         f"nearby cells within {', '.join(map(str, buffer_distances))} unit buffer zones. "
     )
-    
+
     fig.text(
-        0.5, 0.01, explanation_text, 
-        ha='center', va='bottom', fontsize=12,
-        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8)
+        0.5,
+        0.01,
+        explanation_text,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8),
     )
-    
+
     # Make sure layout adapts to the content
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
+
     return fig
 
+
 def create_visualization_border_cell_radius(
-    region_name, group_name, df_community, df_full, 
-    cluster_column="cluster", identification_column=None, 
-    x_column="x", y_column="y", radius=200, 
-    hull_points=None, proximity_results=None, hull_neighbors=None,
-    figsize=(20, 16)
+    region_name,
+    group_name,
+    df_community,
+    df_full,
+    cluster_column="cluster",
+    identification_column=None,
+    x_column="x",
+    y_column="y",
+    radius=200,
+    hull_points=None,
+    proximity_results=None,
+    hull_neighbors=None,
+    figsize=(20, 16),
 ):
     """
     Create a multi-panel visualization for the border cell radius proximity analysis method.
@@ -4450,392 +4616,525 @@ def create_visualization_border_cell_radius(
 
     # Filter to show only clustered points
     df_filtered = df_community[df_community[cluster_column] != -1]
-    
+
     # Create a colormap for clusters
     unique_clusters = sorted(df_filtered[cluster_column].unique())
     n_clusters = len(unique_clusters)
-    
+
     # Create a colorblind-friendly color palette for clusters
     cluster_colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_clusters)))
     cluster_cmap = mcolors.ListedColormap(cluster_colors[:n_clusters])
-    
+
     # Convert radius to list if it's a single value
     if not isinstance(radius, (list, tuple, np.ndarray)):
         radius_list = [radius]
     else:
         radius_list = radius
-    
+
     # Create a color mapping for different radii
     radius_colors = plt.cm.plasma(np.linspace(0, 0.8, len(radius_list)))
     radius_color_map = {r: radius_colors[i] for i, r in enumerate(radius_list)}
-    
+
     # Calculate data bounds to maintain consistent view across all plots
     x_min = df_full[x_column].min()
     x_max = df_full[x_column].max()
     y_min = df_full[y_column].min()
     y_max = df_full[y_column].max()
-    
+
     # Add some padding to the bounds (5% on each side)
     x_padding = 0.05 * (x_max - x_min)
     y_padding = 0.05 * (y_max - y_min)
     x_bounds = [x_min - x_padding, x_max + x_padding]
     y_bounds = [y_min - y_padding, y_max + y_padding]
-    
+
     # Create figure with adequate spacing between subplots
     fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
     axes = axes.flatten()
-    
+
     # PANEL 1: Original clustering
 
     ax1 = axes[0]
-    
+
     # Plot all points in the region with low opacity
     ax1.scatter(
-        df_full[x_column], df_full[y_column], 
-        color='lightgray', alpha=0.3, s=10, 
-        label='All cells'
+        df_full[x_column],
+        df_full[y_column],
+        color="lightgray",
+        alpha=0.3,
+        s=10,
+        label="All cells",
     )
-    
+
     # Plot clustered points with colors by cluster
     scatter1 = ax1.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered[cluster_column], cmap=cluster_cmap, 
-        alpha=0.7, s=30, edgecolor='none'
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.7,
+        s=30,
+        edgecolor="none",
     )
-    
+
     # Mark noise points with 'x'
     noise_points = df_community[df_community[cluster_column] == -1]
     if len(noise_points) > 0:
         ax1.scatter(
-            noise_points[x_column], noise_points[y_column], 
-            color='gray', marker='x', s=20, alpha=0.5,
-            label='Noise points'
+            noise_points[x_column],
+            noise_points[y_column],
+            color="gray",
+            marker="x",
+            s=20,
+            alpha=0.5,
+            label="Noise points",
         )
-    
-    ax1.set_title(f"HDBSCAN Clustering of {group_name} in Region {region_name}", fontsize=14)
+
+    ax1.set_title(
+        f"HDBSCAN Clustering of {group_name} in Region {region_name}", fontsize=14
+    )
     ax1.set_xlabel(x_column, fontsize=12)
     ax1.set_ylabel(y_column, fontsize=12)
     ax1.grid(alpha=0.3)
-    ax1.set_aspect('equal')
+    ax1.set_aspect("equal")
     ax1.set_xlim(x_bounds)
     ax1.set_ylim(y_bounds)
-    
+
     # Add legend for clusters
     if n_clusters <= 10:  # Only show legend for reasonable number of clusters
         legend1 = ax1.legend(
-            handles=[Patch(color=cluster_cmap(i), label=f'Cluster {cluster}') 
-                    for i, cluster in enumerate(unique_clusters)],
-            title="Clusters", loc="best", frameon=True, 
-            bbox_to_anchor=(1.02, 1), fontsize=10
+            handles=[
+                Patch(color=cluster_cmap(i), label=f"Cluster {cluster}")
+                for i, cluster in enumerate(unique_clusters)
+            ],
+            title="Clusters",
+            loc="best",
+            frameon=True,
+            bbox_to_anchor=(1.02, 1),
+            fontsize=10,
         )
         ax1.add_artist(legend1)
     else:
         # Add colorbar instead
         cbar = fig.colorbar(scatter1, ax=ax1, pad=0.01, shrink=0.8)
-        cbar.set_label('Cluster ID')
-    
+        cbar.set_label("Cluster ID")
+
     # Annotate with number of clusters and noise points
     ax1.annotate(
-        f"Number of clusters: {n_clusters}\n"
-        f"Noise points: {len(noise_points)}",
-        xy=(0.02, 0.98), xycoords='axes fraction',
-        fontsize=11, ha='left', va='top',
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
+        f"Number of clusters: {n_clusters}\n" f"Noise points: {len(noise_points)}",
+        xy=(0.02, 0.98),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
     )
-    
+
     # PANEL 2: Concave Hull Identification
 
     ax2 = axes[1]
-    
+
     # Plot clustered points with reduced opacity
     ax2.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered[cluster_column], cmap=cluster_cmap,
-        alpha=0.3, s=20
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
     )
-    
+
     # Plot hull points if provided
     if hull_points is not None and len(hull_points) > 0:
         # Group by cluster if multiple clusters
         for cluster in unique_clusters:
-            cluster_hull = hull_points[hull_points["patch_id"] == cluster] if "patch_id" in hull_points.columns else hull_points
-            
+            cluster_hull = (
+                hull_points[hull_points["patch_id"] == cluster]
+                if "patch_id" in hull_points.columns
+                else hull_points
+            )
+
             if len(cluster_hull) > 0:
                 # Plot hull points
                 ax2.scatter(
-                    cluster_hull[x_column], cluster_hull[y_column],
-                    color='red', s=50, 
-                    edgecolor='black', linewidth=1, alpha=0.8,
-                    label='Hull Points' if cluster == unique_clusters[0] else ""
+                    cluster_hull[x_column],
+                    cluster_hull[y_column],
+                    color="red",
+                    s=50,
+                    edgecolor="black",
+                    linewidth=1,
+                    alpha=0.8,
+                    label="Hull Points" if cluster == unique_clusters[0] else "",
                 )
-                
+
                 # Connect hull points to show the boundary
                 if len(cluster_hull) > 2:
                     hull_x = cluster_hull[x_column].values
                     hull_y = cluster_hull[y_column].values
-                    
+
                     # If ordered by 'order' column, use that ordering
-                    if 'order' in cluster_hull.columns:
-                        ordered_hull = cluster_hull.sort_values('order')
+                    if "order" in cluster_hull.columns:
+                        ordered_hull = cluster_hull.sort_values("order")
                         hull_x = ordered_hull[x_column].values
                         hull_y = ordered_hull[y_column].values
-                        
+
                     # Close the loop by adding the first point again
                     hull_x = np.append(hull_x, hull_x[0])
                     hull_y = np.append(hull_y, hull_y[0])
-                    
+
                     cluster_idx = unique_clusters.index(cluster)
                     color = cluster_cmap(cluster_idx)
-                    ax2.plot(hull_x, hull_y, color=color, linestyle='-', 
-                             linewidth=2, alpha=0.7, 
-                             label=f'Hull Boundary (C{cluster})' if cluster == unique_clusters[0] else "")
-    
+                    ax2.plot(
+                        hull_x,
+                        hull_y,
+                        color=color,
+                        linestyle="-",
+                        linewidth=2,
+                        alpha=0.7,
+                        label=(
+                            f"Hull Boundary (C{cluster})"
+                            if cluster == unique_clusters[0]
+                            else ""
+                        ),
+                    )
+
     ax2.set_title("Concave Hull Boundary Detection", fontsize=14)
     ax2.set_xlabel(x_column, fontsize=12)
     ax2.set_ylabel(y_column, fontsize=12)
     ax2.grid(alpha=0.3)
-    ax2.set_aspect('equal')
+    ax2.set_aspect("equal")
     ax2.set_xlim(x_bounds)
     ax2.set_ylim(y_bounds)
-    
+
     # Add explanation of concave hull
     ax2.annotate(
         "Concave hull forms the\nouter boundary of each cluster",
-        xy=(0.02, 0.02), xycoords='axes fraction',
-        fontsize=11, ha='left', va='bottom',
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
+        xy=(0.02, 0.02),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
     )
-    
+
     ax2.legend(loc="best", bbox_to_anchor=(1.02, 1))
-    
+
     # PANEL 3: Radius Search from Hull Points
 
     ax3 = axes[2]
-    
+
     # Plot background with even lower alpha to make circles more visible
     ax3.scatter(
-        df_full[x_column], df_full[y_column], 
-        color='lightgray', alpha=0.1, s=10
+        df_full[x_column], df_full[y_column], color="lightgray", alpha=0.1, s=10
     )
-    
+
     # Plot clustered points with lower alpha to improve circle visibility
     ax3.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered[cluster_column], cmap=cluster_cmap,
-        alpha=0.3, s=20
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
     )
-    
+
     # Show search radius from ALL hull points with improved visibility
     if hull_neighbors is not None and len(hull_neighbors) > 0:
         # Better alpha calculation - minimum 0.2 alpha to ensure visibility
         num_circles = len(hull_neighbors) * len(radius_list)
         min_alpha = 0.2  # Minimum alpha value for visibility
-        
+
         # If many circles, use a more aggressive scale-down but never below min_alpha
         if num_circles > 30:
             circle_alpha = max(min_alpha, 0.6 - (num_circles - 30) * 0.005)
         else:
             circle_alpha = max(min_alpha, 0.6 - num_circles * 0.005)
-        
+
         # Create a list to hold circle objects for the legend
         legend_circles = []
-        
+
         # Draw circles for all hull points with different colors for each radius
         for idx, hull_point in hull_neighbors.iterrows():
             for r_idx, r in enumerate(radius_list):
                 # Get color for this radius
                 circle_color = radius_color_map[r]
                 circle_width = 1.0  # Slightly thicker lines
-                
+
                 # Draw search circle with improved visibility
                 circle = Circle(
-                    (hull_point[x_column], hull_point[y_column]), 
-                    r, color=circle_color, fill=False, 
-                    linestyle='--', linewidth=circle_width, alpha=circle_alpha
+                    (hull_point[x_column], hull_point[y_column]),
+                    r,
+                    color=circle_color,
+                    fill=False,
+                    linestyle="--",
+                    linewidth=circle_width,
+                    alpha=circle_alpha,
                 )
                 ax3.add_patch(circle)
-                
+
                 # Create a single circle for legend (only once per radius)
                 if idx == 0:
-                    legend_circle = Circle((0, 0), 1, color=circle_color, fill=False, 
-                                          linestyle='--', linewidth=circle_width, alpha=0.8)
+                    legend_circle = Circle(
+                        (0, 0),
+                        1,
+                        color=circle_color,
+                        fill=False,
+                        linestyle="--",
+                        linewidth=circle_width,
+                        alpha=0.8,
+                    )
                     ax3.add_patch(legend_circle)
                     legend_circle.set_visible(False)  # Hide it, just for legend
                     legend_circles.append((legend_circle, f"Search radius ({r} units)"))
-        
+
         # Hull points are drawn on top of circles with high visibility
         ax3.scatter(
-            hull_neighbors[x_column], hull_neighbors[y_column],
-            color='red', s=40, edgecolor='black',
-            linewidth=0.8, alpha=0.8,
-            label='Hull Points'
+            hull_neighbors[x_column],
+            hull_neighbors[y_column],
+            color="red",
+            s=40,
+            edgecolor="black",
+            linewidth=0.8,
+            alpha=0.8,
+            label="Hull Points",
         )
-    
+
     # Format radii for title
-    radii_str = ", ".join(map(str, radius_list)) if len(radius_list) > 1 else str(radius_list[0])
+    radii_str = (
+        ", ".join(map(str, radius_list))
+        if len(radius_list) > 1
+        else str(radius_list[0])
+    )
     ax3.set_title(f"Search Radii ({radii_str} units) from Hull Points", fontsize=14)
     ax3.set_xlabel(x_column, fontsize=12)
     ax3.set_ylabel(y_column, fontsize=12)
     ax3.grid(alpha=0.3)
-    ax3.set_aspect('equal')
+    ax3.set_aspect("equal")
     ax3.set_xlim(x_bounds)
     ax3.set_ylim(y_bounds)
-    
+
     # Add explanation of search radius
     if hull_neighbors is not None:
-        radius_text = ", ".join(map(str, radius_list)) if len(radius_list) > 1 else str(radius_list[0])
+        radius_text = (
+            ", ".join(map(str, radius_list))
+            if len(radius_list) > 1
+            else str(radius_list[0])
+        )
         ax3.annotate(
             f"All {len(hull_neighbors)} hull points search for\n"
             f"neighboring cells within {radius_text} units",
-            xy=(0.02, 0.02), xycoords='axes fraction',
-            fontsize=11, ha='left', va='bottom',
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
+            xy=(0.02, 0.02),
+            xycoords="axes fraction",
+            fontsize=11,
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
         )
-    
+
     # Legend for radius circles
     if hull_neighbors is not None and len(hull_neighbors) > 0 and legend_circles:
         circles, labels = zip(*legend_circles)
         ax3.legend(circles, labels, loc="upper right")
-    
+
     # PANEL 4: Proximity Results - Show all points
 
     ax4 = axes[3]
-    
+
     # Start with background - all points in the dataset with low opacity
     ax4.scatter(
-        df_full[x_column], df_full[y_column], 
-        color='lightgray', alpha=0.15, s=10,
-        label='All cells'
+        df_full[x_column],
+        df_full[y_column],
+        color="lightgray",
+        alpha=0.15,
+        s=10,
+        label="All cells",
     )
-    
+
     # Plot clustered points with colors by cluster to highlight the community
     ax4.scatter(
-        df_filtered[x_column], df_filtered[y_column], 
-        c=df_filtered[cluster_column], cmap=cluster_cmap,
-        alpha=0.4, s=20
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.4,
+        s=20,
     )
-    
+
     # Plot hull points with increased visibility
     if hull_points is not None and len(hull_points) > 0:
         ax4.scatter(
-            hull_points[x_column], hull_points[y_column],
-            color='red', s=30, alpha=0.7,
-            edgecolor='black', linewidth=0.5,
-            label='Hull Points'
+            hull_points[x_column],
+            hull_points[y_column],
+            color="red",
+            s=30,
+            alpha=0.7,
+            edgecolor="black",
+            linewidth=0.5,
+            label="Hull Points",
         )
-    
+
     # Plot proximity results (points from other categories near hull)
     if proximity_results is not None and len(proximity_results) > 0:
         # Check if we need to visualize different radii
-        if 'distance_from_patch' in proximity_results.columns and len(radius_list) > 1:
+        if "distance_from_patch" in proximity_results.columns and len(radius_list) > 1:
             # For each radius, plot points with a different marker or color
             for r_idx, r in enumerate(radius_list):
-                r_points = proximity_results[proximity_results['distance_from_patch'] == r]
-                
+                r_points = proximity_results[
+                    proximity_results["distance_from_patch"] == r
+                ]
+
                 if len(r_points) > 0:
                     # If identification column is provided, use different colors for categories
-                    if identification_column is not None and identification_column in r_points.columns:
+                    if (
+                        identification_column is not None
+                        and identification_column in r_points.columns
+                    ):
                         # Get unique categories in proximity results
                         prox_categories = r_points[identification_column].unique()
-                        
+
                         # Create color mapping for categories
-                        category_colors = plt.cm.Set2(np.linspace(0, 1, len(prox_categories)))
-                        
+                        category_colors = plt.cm.Set2(
+                            np.linspace(0, 1, len(prox_categories))
+                        )
+
                         # Markers for different radii (cycle through a few options)
-                        markers = ['o', 's', '^', 'd', '*']  # circle, square, triangle, diamond, star
+                        markers = [
+                            "o",
+                            "s",
+                            "^",
+                            "d",
+                            "*",
+                        ]  # circle, square, triangle, diamond, star
                         marker = markers[r_idx % len(markers)]
-                        
+
                         # Plot each category with different color but same marker for this radius
                         for i, category in enumerate(prox_categories):
-                            category_points = r_points[r_points[identification_column] == category]
+                            category_points = r_points[
+                                r_points[identification_column] == category
+                            ]
                             ax4.scatter(
-                                category_points[x_column], category_points[y_column],
-                                color=category_colors[i], marker=marker, s=80, alpha=0.8,
-                                edgecolor='black', linewidth=0.5,
-                                label=f"{category} ({r} units)"
+                                category_points[x_column],
+                                category_points[y_column],
+                                color=category_colors[i],
+                                marker=marker,
+                                s=80,
+                                alpha=0.8,
+                                edgecolor="black",
+                                linewidth=0.5,
+                                label=f"{category} ({r} units)",
                             )
                     else:
                         # Use same color scheme as for radius circles with different markers
                         color = radius_color_map[r]
-                        markers = ['o', 's', '^', 'd', '*']
+                        markers = ["o", "s", "^", "d", "*"]
                         marker = markers[r_idx % len(markers)]
-                        
+
                         ax4.scatter(
-                            r_points[x_column], r_points[y_column],
-                            color=color, marker=marker, s=80, alpha=0.8,
-                            edgecolor='black', linewidth=0.5,
-                            label=f"Proximity Points ({r} units)"
+                            r_points[x_column],
+                            r_points[y_column],
+                            color=color,
+                            marker=marker,
+                            s=80,
+                            alpha=0.8,
+                            edgecolor="black",
+                            linewidth=0.5,
+                            label=f"Proximity Points ({r} units)",
                         )
         else:
             # Original behavior for single radius
-            if identification_column is not None and identification_column in proximity_results.columns:
+            if (
+                identification_column is not None
+                and identification_column in proximity_results.columns
+            ):
                 # Get unique categories in proximity results
                 prox_categories = proximity_results[identification_column].unique()
-                
+
                 # Create color mapping for categories
                 category_colors = plt.cm.Set2(np.linspace(0, 1, len(prox_categories)))
-                
+
                 # Plot each category with different color
                 for i, category in enumerate(prox_categories):
-                    category_points = proximity_results[proximity_results[identification_column] == category]
+                    category_points = proximity_results[
+                        proximity_results[identification_column] == category
+                    ]
                     ax4.scatter(
-                        category_points[x_column], category_points[y_column],
-                        color=category_colors[i], marker='o', s=80, alpha=0.8,
-                        edgecolor='black', linewidth=0.5,
-                        label=f"{category}"
+                        category_points[x_column],
+                        category_points[y_column],
+                        color=category_colors[i],
+                        marker="o",
+                        s=80,
+                        alpha=0.8,
+                        edgecolor="black",
+                        linewidth=0.5,
+                        label=f"{category}",
                     )
             else:
                 # Plot all proximity points with same color
                 ax4.scatter(
-                    proximity_results[x_column], proximity_results[y_column],
-                    color='gold', marker='o', s=80, alpha=0.8,
-                    edgecolor='black', linewidth=0.5,
-                    label="Proximity Points"
+                    proximity_results[x_column],
+                    proximity_results[y_column],
+                    color="gold",
+                    marker="o",
+                    s=80,
+                    alpha=0.8,
+                    edgecolor="black",
+                    linewidth=0.5,
+                    label="Proximity Points",
                 )
-    
+
     ax4.set_title("Detected Points in Proximity to Clusters", fontsize=14)
     ax4.set_xlabel(x_column, fontsize=12)
     ax4.set_ylabel(y_column, fontsize=12)
     ax4.grid(alpha=0.3)
-    ax4.set_aspect('equal')
+    ax4.set_aspect("equal")
     ax4.set_xlim(x_bounds)
     ax4.set_ylim(y_bounds)
-    
+
     # Add explanation text
     prox_count = len(proximity_results) if proximity_results is not None else 0
     ax4.annotate(
         f"Found {prox_count} cells from different\ncategories near cluster boundaries",
-        xy=(0.02, 0.02), xycoords='axes fraction',
-        fontsize=11, ha='left', va='bottom',
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
+        xy=(0.02, 0.02),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
     )
-    
+
     # Position the legend
     ax4.legend(loc="best", bbox_to_anchor=(1.02, 1))
-    
 
     # Add overall title and explanation
 
     fig.suptitle(
         f"Border Cell Radius Proximity Analysis for {group_name} in Region {region_name}",
-        fontsize=18, y=0.98
+        fontsize=18,
+        y=0.98,
     )
-    
+
     # Add explanatory text at the bottom with radius list
-    radii_text = ", ".join(map(str, radius_list)) if len(radius_list) > 1 else str(radius_list[0])
+    radii_text = (
+        ", ".join(map(str, radius_list))
+        if len(radius_list) > 1
+        else str(radius_list[0])
+    )
     explanation_text = (
         "This analysis: (1) Clusters cells using HDBSCAN algorithm, (2) Identifies the concave hull boundary of each cluster, "
         f"(3) For each hull point, searches for cells within {radii_text} units, and "
         "(4) Identifies cells from different categories that are in proximity to cluster boundaries."
     )
-    
+
     fig.text(
-        0.5, 0.01, explanation_text, 
-        ha='center', va='bottom', fontsize=12,
-        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8)
+        0.5,
+        0.01,
+        explanation_text,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8),
     )
-    
+
     # Make sure layout adapts to the content
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
+
     return fig

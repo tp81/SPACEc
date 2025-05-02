@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import seaborn as sns
-from scipy.stats import norm, zscore
 import torch
+from scipy.stats import norm, zscore
 
 
 # read the data frame output from the segmentation functions
@@ -609,7 +609,9 @@ class ImageProcessor:
 
         channel_sums = np.zeros((n_masks, n_channels), dtype=np.float32)
         for ch in range(n_channels):
-            channel_sums[:, ch] = np.bincount(mask_ids, weights=image_valid[:, ch], minlength=n_masks)
+            channel_sums[:, ch] = np.bincount(
+                mask_ids, weights=image_valid[:, ch], minlength=n_masks
+            )
         counts = np.bincount(mask_ids, minlength=n_masks)
         channel_counts = np.tile(counts, (n_channels, 1)).T
 
@@ -673,12 +675,16 @@ class ImageProcessor:
 
         # Run the least squares solver using torch on CUDA if available, otherwise use MPS on Mac, else CPU.
         device = torch.device(
-            "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+            "cuda"
+            if torch.cuda.is_available()
+            else ("mps" if torch.backends.mps.is_available() else "cpu")
         )
         adjacency_matrix_torch = torch.from_numpy(adj).to(device)
         means_torch = torch.from_numpy(means).to(device)
         results_torch = torch.linalg.lstsq(adjacency_matrix_torch, means_torch).solution
-        results = results_torch.cpu().numpy()  # Move results back to CPU for further computations
+        results = (
+            results_torch.cpu().numpy()
+        )  # Move results back to CPU for further computations
         compensated_means = np.maximum(results, 0)
 
         return compensated_means, means, channel_counts[:, 0]
@@ -734,7 +740,9 @@ def compensate_cell_matrix(df, image_dict, masks, overwrite=True):
     ) = processor.compute_channel_means_sums_compensated(image)
 
     # Get the keys
-    keys = [channel for channel in image_dict.keys() if channel != "segmentation_channel"]
+    keys = [
+        channel for channel in image_dict.keys() if channel != "segmentation_channel"
+    ]
 
     if overwrite:
         new_cols = pd.DataFrame(compensated_means, columns=keys, index=df.index)

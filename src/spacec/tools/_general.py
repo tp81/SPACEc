@@ -3154,11 +3154,11 @@ def identify_points_in_proximity(
     if len(result_list) > 0:
         result = pd.concat(result_list)
     else:
-        result = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+        result = pd.DataFrame(columns=[x_column, y_column, "patch_id", identification_column])
     if len(outline_list) > 0:
         outlines = pd.concat(outline_list)
     else:
-        outlines = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+        outlines = pd.DataFrame(columns=[x_column, y_column, "patch_id", identification_column])
     return result, outlines
 
 

@@ -3264,9 +3264,9 @@ def process_cluster(args, nbrs, unique_clusters):
         concavity=concavity,
     )
     # Get hull points from the DataFrame
-    hull_points = pd.DataFrame(points[idxes], columns=["x", "y"])
+    hull_points = pd.DataFrame(points[idxes], columns=[x_column, y_column])
     # Find nearest neighbors of hull points in the original DataFrame
-    distances, indices = nbrs.kneighbors(hull_points[["x", "y"]])
+    distances, indices = nbrs.kneighbors(hull_points[[x_column, y_column]])
     hull_nearest_neighbors = df.iloc[indices.flatten()]
 
     # Convert radius to a list if it's a single value
@@ -3276,9 +3276,9 @@ def process_cluster(args, nbrs, unique_clusters):
         radius_list = radius
 
     # Extract hull points coordinates
-    hull_coords = hull_nearest_neighbors[["x", "y"]].values
+    hull_coords = hull_nearest_neighbors[[x_column, y_column]].values
     # Calculate distances from all points in full_df to all hull points
-    distances = cdist(full_df[["x", "y"]].values, hull_coords)
+    distances = cdist(full_df[[x_column, y_column]].values, hull_coords)
 
     # Process each radius
     all_prox_points = []

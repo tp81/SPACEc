@@ -6,7 +6,7 @@ import pytest
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-@pytest.mark.slow
+# @pytest.mark.slow
 def test_3_cell_annotation_STELLAR():
     # import standard packages
 

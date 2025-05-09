@@ -1,24 +1,23 @@
+import os
 import random
 
 import matplotlib.pyplot as plt
 import numpy as np
 import skimage.io
 from deepcell.utils.plot_utils import create_rgb_image, make_outline_overlay
-from skimage.measure import regionprops_table
 
 from .._shared.segmentation import combine_channels, format_CODEX
 
 
-# plot membrane channel selected for segmentation
 def segmentation_ch(
     file_name,  # image for segmentation
     channel_file,  # all channels used for staining
     output_dir,
-    savefig=False,  # new
-    output_fname="",  # new
+    savefig=False,
+    output_fname="",
     extra_seg_ch_list=None,  # channels used for membrane segmentation
     nuclei_channel="DAPI",
-    input_format="Multichannel",  # CODEX or Phenocycler --> This depends on the machine you are using and the resulting file format (see documentation above)
+    input_format="Multichannel",
 ):
     """
     Plot the channel selected for segmentation.
@@ -31,39 +30,62 @@ def segmentation_ch(
         The path to the file containing all channels used for staining.
     output_dir : str
         The directory to save the output in.
+    savefig : bool, optional
+        Whether to save the figure, by default False.
+    output_fname : str, optional
+        The filename for the saved figure, by default "".
     extra_seg_ch_list : list, optional
         The channels used for membrane segmentation, by default None.
     nuclei_channel : str, optional
         The channel used for nuclei, by default "DAPI".
     input_format : str, optional
-        The input_format used (either "CODEX", "Multichannel" or channels), by default "Multichannel".
+        The input_format used (either "CODEX", "Multichannel" or "Channels"), by default "Multichannel".
 
     Returns
     -------
     None
     """
+    import pathlib  # Add import for pathlib if needed
+
     if input_format != "Channels":
         # Load the image
         img = skimage.io.imread(file_name)
         # Read channels and store as list
         with open(channel_file, "r") as f:
             channel_names = f.read().splitlines()
-        # Function reads channels and stores them as a dictionary (storing as a dictionary allows to select specific channels by name)
-        image_dict = format_CODEX(
+        # Function reads channels and stores them as a dictionary and returns the processed channel names
+        image_dict, _ = format_CODEX(
             image=img,
-            channel_names=channel_names,  # file with list of channel names (see channelnames.txt)
+            channel_names=channel_names,
             input_format=input_format,
         )
     else:
-        image_dict = format_CODEX(
+        # In Channels format, file_name is the directory containing individual channel files
+        image_dict, _ = format_CODEX(
             image=file_name,
-            channel_names=None,  # file with list of channel names (see channelnames.txt)
+            channel_names=None,
             input_format=input_format,
         )
 
+    if image_dict is None:
+        print("Error: Failed to format image data")
+        return
+
+    # Check if nuclei_channel exists
+    if nuclei_channel not in image_dict:
+        print(f"Warning: Nuclei channel '{nuclei_channel}' not found in image data.")
+        print(f"Available channels: {list(image_dict.keys())}")
+        return
+
+    # Combine channels for segmentation - FIX: only expect a single return value
     image_dict = combine_channels(
         image_dict, extra_seg_ch_list, new_channel_name="segmentation_channel"
     )
+
+    # Check if segmentation channel was created
+    if "segmentation_channel" not in image_dict:
+        print("Error: Failed to create segmentation channel")
+        return
 
     fig, ax = plt.subplots(1, 2, figsize=(15, 15))
     ax[0].imshow(image_dict[nuclei_channel])
@@ -73,13 +95,18 @@ def segmentation_ch(
 
     # save or plot figure
     if savefig:
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        # Use os.path.join for proper path handling
+        output_path = os.path.join(output_dir, f"{output_fname}.pdf")
         plt.savefig(
-            output_dir + output_fname + ".pdf",
+            output_path,
             format="pdf",
             dpi=300,
             transparent=True,
             bbox_inches="tight",
         )
+        print(f"Saved figure to: {output_path}")
     else:
         plt.show()
 

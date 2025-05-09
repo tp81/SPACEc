@@ -54,6 +54,29 @@ def test_cell_segmentation():
             size_cutoff=0,
         )
 
+        print("Cell Tiled Segmentation Mesmer")
+        # choose between cellpose or mesmer for segmentation
+        # first image
+        # seg_output contains {'img': img, 'image_dict': image_dict, 'masks': masks}
+        seg_output1 = sp.tl.cell_segmentation(
+            file_name=data_path / "raw/tonsil/1/reg010_X01_Y01_Z01.tif",
+            channel_file=data_path / "raw/tonsil/channelnames.txt",
+            output_dir=output_dir,
+            output_fname="tonsil1",
+            seg_method="mesmer",  # cellpose or mesmer
+            nuclei_channel="DAPI",
+            membrane_channel_list=[
+                "CD45",
+                "betaCatenin",
+            ],  # default is None; if provide more than one channel, then they will be combined
+            compartment="whole-cell",  # mesmer # segment whole cells or nuclei only
+            input_format="Multichannel",  # Phenocycler or codex
+            size_cutoff=0,
+            tile_size=32,  # Default tile size
+            tile_overlap=0,  # Default tile overlap
+            tiling_threshold=32,  # Minimum image size to use tiling
+        )
+
         print("Cell Segmentation Cellpose")
         seg_output_cellpose = sp.tl.cell_segmentation(
             file_name=data_path / "raw/tonsil/1/reg010_X01_Y01_Z01.tif",
@@ -73,6 +96,30 @@ def test_cell_segmentation():
             size_cutoff=0,
             use_gpu=gpu,
         )
+
+        print("Cell Tiled Segmentation Cellpose")
+        seg_output_cellpose = sp.tl.cell_segmentation(
+            file_name=data_path / "raw/tonsil/1/reg010_X01_Y01_Z01.tif",
+            channel_file=data_path / "raw/tonsil/channelnames.txt",
+            output_dir=output_dir,
+            output_fname="tonsil2",
+            seg_method="cellpose",  # cellpose or mesmer
+            model="cyto3",  # cellpose model
+            diameter=28,  # average cell diameter (in pixels). If set to None, it will be automatically estimated.
+            nuclei_channel="DAPI",
+            membrane_channel_list=[
+                "CD45",
+                "betaCatenin",
+            ],  # default is None #default is None; if provide more than one channel, then they will be combined
+            input_format="Multichannel",  # Phenocycler or codex
+            resize_factor=1,  # default is 1; if the image is too large, lower the value. Lower values will speed up the segmentation but may reduce the accuracy.
+            size_cutoff=0,
+            use_gpu=gpu,
+            tile_size=32,  # Default tile size
+            tile_overlap=0,  # Default tile overlap
+            tiling_threshold=32,  # Minimum image size to use tiling
+        )
+
         print("Cell Segmentation Cellpose with custom model")
         seg_output_cellpose = sp.tl.cell_segmentation(
             file_name=data_path / "raw/tonsil/1/reg010_X01_Y01_Z01.tif",

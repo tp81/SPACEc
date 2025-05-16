@@ -101,6 +101,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.svm import SVC
 from tqdm import tqdm
 from yellowbrick.cluster import KElbowVisualizer
+from sklearn.neighbors import KNeighborsClassifier
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -2133,80 +2134,114 @@ def adata_stellar(
 def ml_train(
     adata_train,
     label,
-    test_size=0.33,
+    test_size=0.2,
     random_state=0,
-    model="svm",
-    nan_policy_y="raise",
+    nan_policy_y="omit",
+    mode="accurate_SVC",  # 'accurate_SVC' or 'fast_SVC' or 'knn'
     showfig=True,
-    figsize=(10, 8),
+    figsize=(8,6),
+    n_neighbors=5,  # Number of neighbors for KNN
 ):
     """
-    Train a svm model on the provided data.
+    Train a classifier (SVC, LinearSVC, or KNN) on the data.
 
     Parameters
     ----------
-    adata_train : AnnData
-        The training data as an AnnData object.
+    adata_train : anndata.AnnData
+        The AnnData object containing the training data. The input features are expected in adata_train.X,
+        and the target labels in adata_train.obs[label].
     label : str
-        The label to predict.
+        The column name in adata_train.obs to use as the target variable.
     test_size : float, optional
-        The proportion of the dataset to include in the test split, by default 0.33.
+        The proportion of the dataset to include in the test split. Default is 0.2.
     random_state : int, optional
-        The seed used by the random number generator, by default 0.
-    model : str, optional
-        The type of model to train, by default "svm".
-    nan_policy_y : str, optional
-        How to handle NaNs in the label, by default "raise". Can be either 'omit' or 'raise'.
+        Seed for the random number generator. Default is 0.
+    nan_policy_y : {'omit', 'raise'}, optional
+        Policy for handling NaNs in the target variable. 'omit' removes NaNs, 'raise' raises an error.
+        Default is 'omit'.
+    mode : {'accurate_SVC', 'fast_SVC', 'knn'}, optional
+        The type of classifier to use.
+        - 'accurate_SVC': Uses SVC with probability=True (slower, provides predict_proba).
+        - 'fast_SVC': Uses LinearSVC with CalibratedClassifierCV (faster, optional predict_proba).
+        - 'knn': Uses KNeighborsClassifier with specified n_neighbors.
+        Default is 'accurate_SVC'.
     showfig : bool, optional
-        Whether to show the confusion matrix as a heatmap, by default True.
+        Whether to display a heatmap of the classification report. Default is True.
+    figsize : tuple, optional
+        Size of the figure if showfig is True. Default is (8, 6).
+    n_neighbors : int, optional
+        Number of neighbors for KNN classifier. Default is 5.
 
     Returns
     -------
-    SVC
-        The trained Support Vector Classifier model.
+    svc : sklearn.base.BaseEstimator
+        The trained classifier model. For 'accurate_SVC' and 'fast_SVC', the model supports predict_proba.
+        For 'knn', only predict is available.
 
     Raises
     ------
     ValueError
-        If `nan_policy_y` is not 'omit' or 'raise'.
-    """
-    X = pd.DataFrame(adata_train.X)
-    y = adata_train.obs[label].values
+        If `mode` is not one of the allowed options, or if `nan_policy_y` is not 'omit' or 'raise'.
 
+    Notes
+    -----
+    - The function handles NaNs in the target variable based on `nan_policy_y`.
+    - For 'accurate_SVC', the classifier provides `predict_proba` for probability estimates.
+    - For 'fast_SVC', the classifier uses LinearSVC with calibration for `predict_proba`.
+    - For 'knn', the classifier uses KNeighborsClassifier with the specified `n_neighbors`.
+    - The classification report is displayed as a heatmap if `showfig` is True.
+    - The function prints progress messages (e.g., "Preparing training data!", "Training now!", etc.).
+    """
+    print("Preparing training data!")
+    X = adata_train.X
+    if not isinstance(X, np.ndarray):
+        X = X.toarray()
+    y = adata_train.obs[label].values
     if nan_policy_y == "omit":
-        y_msk = ~y.isna()
+        y_msk = ~pd.isna(y)   # <-- pd.isna works fine with mixed types
         X = X[y_msk]
         y = y[y_msk]
-    elif nan_policy_y == "raise":
-        pass
-    else:
+    elif nan_policy_y != "raise":
         raise ValueError("nan_policy_y must be either 'omit' or 'raise'")
-
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
-
-    print(y.unique().sort_values())
-
+    print("Unique labels:", np.unique(y))  # Adjusted for clarity
     print("Training now!")
-    svc = SVC(kernel="linear", probability=True)
+    if mode == "accurate_SVC":
+        svc = SVC(kernel="linear", probability=True)  # SVC with probability
+    elif mode == "knn":
+        print("Using KNN classifier with n_neighbors = ", n_neighbors)
+        svc = KNeighborsClassifier(n_neighbors=n_neighbors)
+    elif mode == "fast_SVC":
+        base_svc = LinearSVC()
+        svc = CalibratedClassifierCV(base_svc)  # CalibratedClassifierCV to add predict_proba
+    else:
+        raise ValueError("mode must be 'accurate_SVC', 'fast_SVC', or 'knn'")
     svc.fit(X_train, y_train)
-    pred = []
-    y_prob = svc.predict_proba(X_test)
-    y_prob = pd.DataFrame(y_prob)
-    y_prob.columns = svc.classes_
-
-    svm_label = y_prob.idxmax(axis=1, skipna=True)
-    target_names = svc.classes_
     print("Evaluating now!")
+    # Predict probability only for 'accurate' mode
+    if mode == "accurate_SVC":
+        y_prob = svc.predict_proba(X_test)
+        y_prob = pd.DataFrame(y_prob, columns=svc.classes_)
+        svm_label = y_prob.idxmax(axis=1)
+    elif mode == "knn":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    elif mode == "fast_SVC":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    # Generate classification report
+    target_names = svc.classes_
     svm_eval = classification_report(
-        y_true=y_test, y_pred=svm_label, target_names=target_names, output_dict=True
+        y_true=y_test,
+        y_pred=svm_label,
+        target_names=target_names,
+        output_dict=True
     )
     if showfig:
         plt.figure(figsize=figsize)
         sns.heatmap(pd.DataFrame(svm_eval).iloc[:-1, :].T, annot=True)
+        plt.title(f"Classification Report ({mode})")
         plt.show()
-
     return svc
 
 

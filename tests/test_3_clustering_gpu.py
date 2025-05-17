@@ -1,9 +1,12 @@
 import pathlib
 from tempfile import TemporaryDirectory
 
+import pytest
+
 TEST_DIR = pathlib.Path(__file__).parent
 
 
+@pytest.mark.gpu
 def test_3_clustering_gpu():
     # ## Set up environment
 

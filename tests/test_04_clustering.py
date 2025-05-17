@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_3_clustering():
+def test_clustering():
     # ## Set up environment
 
     # import standard packages
@@ -315,4 +315,4 @@ def test_3_clustering():
 
 
 if __name__ == "__main__":
-    test_3_clustering()
+    test_clustering()

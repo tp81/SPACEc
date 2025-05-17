@@ -7,7 +7,7 @@ TEST_DIR = pathlib.Path(__file__).parent
 
 
 @pytest.mark.gpu
-def test_3_clustering_gpu():
+def test_clustering_gpu():
     # ## Set up environment
 
     # import standard packages
@@ -316,4 +316,4 @@ def test_3_clustering_gpu():
 
 
 if __name__ == "__main__":
-    test_3_clustering_gpu()
+    test_clustering_gpu()

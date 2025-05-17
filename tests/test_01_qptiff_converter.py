@@ -79,4 +79,4 @@ def test_qptiff_converter():
 
 
 if __name__ == "__main__":
-    test_cell_segmentation()
+    test_qptiff_converter()

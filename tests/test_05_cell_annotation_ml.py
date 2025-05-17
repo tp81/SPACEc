@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_3_cell_annotation_ml():
+def test_cell_annotation_ml():
     # import standard packages
     import os
     import pathlib
@@ -123,4 +123,4 @@ def test_3_cell_annotation_ml():
 
 
 if __name__ == "__main__":
-    test_3_cell_annotation_ml()
+    test_cell_annotation_ml()

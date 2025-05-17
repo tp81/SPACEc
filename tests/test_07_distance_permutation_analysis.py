@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_5_distance_permutation_analysis():
+def test_distance_permutation_analysis():
     # Set up environment
     import matplotlib
     import scanpy as sc
@@ -85,4 +85,4 @@ def test_5_distance_permutation_analysis():
 
 
 if __name__ == "__main__":
-    test_5_distance_permutation_analysis()
+    test_distance_permutation_analysis()

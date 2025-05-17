@@ -1,12 +1,10 @@
 import pathlib
 
-import pytest
-
 TEST_DIR = pathlib.Path(__file__).parent
 
 
 # @pytest.mark.slow
-def test_6_patch_proximity_analysis():
+def test_patch_proximity_analysis():
     # Set up environment
     import matplotlib
     import scanpy as sc
@@ -132,4 +130,4 @@ def test_6_patch_proximity_analysis():
 
 
 if __name__ == "__main__":
-    test_6_patch_proximity_analysis()
+    test_patch_proximity_analysis()

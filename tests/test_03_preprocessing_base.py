@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_2_preprocessing():
+def test_preprocessing():
     import matplotlib
     import numpy as np
 
@@ -142,4 +142,4 @@ def test_2_preprocessing():
 
 
 if __name__ == "__main__":
-    test_2_preprocessing()
+    test_preprocessing()

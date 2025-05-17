@@ -7,7 +7,7 @@ TEST_DIR = pathlib.Path(__file__).parent
 
 
 @pytest.mark.gpu
-def test_3_cell_annotation_STELLAR():
+def test_cell_annotation_STELLAR():
     # import standard packages
 
     # import standard packages
@@ -103,4 +103,4 @@ def test_3_cell_annotation_STELLAR():
 
 
 if __name__ == "__main__":
-    test_3_cell_annotation_STELLAR()
+    test_cell_annotation_STELLAR()

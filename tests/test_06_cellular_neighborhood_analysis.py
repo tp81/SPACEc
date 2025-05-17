@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_4_cellular_neighborhood_analysis():
+def test_cellular_neighborhood_analysis():
     # Set up environment
     import matplotlib
     import scanpy as sc
@@ -224,4 +224,4 @@ def test_4_cellular_neighborhood_analysis():
 
 
 if __name__ == "__main__":
-    test_4_cellular_neighborhood_analysis()
+    test_cellular_neighborhood_analysis()

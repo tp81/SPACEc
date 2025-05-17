@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 TEST_DIR = pathlib.Path(__file__).parent
 
 
-def test_2_preprocessing_compensation():
+def test_preprocessing_compensation():
     print("Testing compensation")
 
     import spacec as sp
@@ -46,4 +46,4 @@ def test_2_preprocessing_compensation():
 
 
 if __name__ == "__main__":
-    test_2_preprocessing_compensation()
+    test_preprocessing_compensation()

@@ -100,8 +100,8 @@ jobs:
       - name: Install dependencies (macos)
         if: startsWith(matrix.platform, 'macos')
         run: |
-          brew install vips@8.16.1 openslide@4.0.0 graphviz@12.2.1
-          echo "DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}:/opt/homebrew/Cellar/vips/8.16.1/lib:/opt/homebrew/Cellar/openslide/4.0.0/lib" >> $GITHUB_ENV
+          brew install vips graphviz
+          echo "DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}:/opt/homebrew/Cellar/vips/$(brew list --versions vips | awk '{print $2}')/lib:/opt/homebrew/Cellar/openslide/$(brew list --versions openslide | awk '{print $2}')/lib" >> $GITHUB_ENV
           echo "TF_CPP_MIN_LOG_LEVEL=2" >> $GITHUB_ENV
           echo "CUDA_VISIBLE_DEVICES=-1" >> $GITHUB_ENV
 

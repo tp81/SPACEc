@@ -97,9 +97,13 @@ jobs:
           -- -rFEx --durations 10 --color yes  # pytest args
 
       # MAC OS
-      - name: Install dependencies (ubuntu)
+      - name: Install dependencies (macos)
         if: startsWith(matrix.platform, 'macos')
-        run: brew install vips graphviz
+        run: |
+          brew install vips@8.16.1 openslide@4.0.0 graphviz@12.2.1
+          echo "DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}:/opt/homebrew/Cellar/vips/8.16.1/lib:/opt/homebrew/Cellar/openslide/4.0.0/lib" >> $GITHUB_ENV
+          echo "TF_CPP_MIN_LOG_LEVEL=2" >> $GITHUB_ENV
+          echo "CUDA_VISIBLE_DEVICES=-1" >> $GITHUB_ENV
 
       - name: Run tests (macos)
         if: startsWith(matrix.platform, 'macos')

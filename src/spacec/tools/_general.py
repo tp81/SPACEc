@@ -20,6 +20,7 @@ import zipfile
 
 import requests
 
+# TODO: Remove this!
 if platform.system() == "Windows":
     vipsbin = r"c:\vips-dev-8.15\bin\vips-dev-8.15\bin"
     vips_file_path = os.path.join(vipsbin, "vips.exe")
@@ -56,12 +57,9 @@ import pickle
 import re
 import time
 from builtins import range
-from itertools import combinations
 from multiprocessing import Pool
 from typing import TYPE_CHECKING
 
-import anndata
-import concave_hull
 import geopandas as gpd
 import matplotlib.patheffects as PathEffects
 import matplotlib.pyplot as plt
@@ -70,31 +68,21 @@ import numpy as np
 import pandas as pd
 import panel as pn
 import scipy.stats as st
-import skimage
-import skimage.color
-import skimage.exposure
 import skimage.filters.rank
-import skimage.io as io
-import skimage.morphology
-import skimage.transform
-import statsmodels.api as sm
 import tissuumaps.jupyter as tj
 import torch
 from concave_hull import concave_hull_indexes
-from descartes import PolygonPatch
 from joblib import Parallel, delayed
-from matplotlib.patches import Circle, Patch
+from matplotlib.patches import Patch
 from pyFlowSOM import map_data_to_nodes, som
 from scipy import stats
-from scipy.spatial import Delaunay, KDTree, distance
+from scipy.spatial import Delaunay
 from scipy.spatial.distance import cdist
-from scipy.stats import pearsonr, spearmanr
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon
+from shapely.geometry import MultiPolygon
 from skimage.io import imsave
 from skimage.segmentation import find_boundaries
 from sklearn.cluster import HDBSCAN, MiniBatchKMeans
 from sklearn.cross_decomposition import CCA
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, f1_score, pairwise_distances
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
@@ -107,11 +95,6 @@ if TYPE_CHECKING:
 
 from ..helperfunctions._general import *
 from ..plotting._general import catplot
-
-try:
-    from torch_geometric.data import ClusterData, ClusterLoader, Data, InMemoryDataset
-except ImportError:
-    pass
 
 try:
     import cupy as cp

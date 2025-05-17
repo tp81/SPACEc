@@ -1,5 +1,7 @@
 import pathlib
 
+import pytest
+
 TEST_DIR = pathlib.Path(__file__).parent
 
 

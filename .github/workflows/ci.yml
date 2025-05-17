@@ -84,13 +84,19 @@ jobs:
         uses: actions/download-artifact@v4
         with: {name: python-distribution-files, path: dist/}
 
+      # UBUNTU
+      - name: Install dependencies (ubuntu)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: sudo apt install -y libvips
+
       - name: Run tests (ubuntu)
         if: startsWith(matrix.platform, 'ubuntu')
         run: >-
-          sudo apt install -y libvips
           pipx run --python '${{ steps.setup-python.outputs.python-path }}'
           tox -e platform-ubuntu --installpkg '${{ needs.prepare.outputs.wheel-distribution }}'
           -- -rFEx --durations 10 --color yes  # pytest args
+
+      # MAC OS
       - name: Run tests (macos)
         if: startsWith(matrix.platform, 'macos')
         run: >-

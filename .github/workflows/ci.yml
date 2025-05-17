@@ -87,7 +87,7 @@ jobs:
       # UBUNTU
       - name: Install dependencies (ubuntu)
         if: startsWith(matrix.platform, 'ubuntu')
-        run: sudo apt install -y libvips
+        run: sudo apt install -y libvips graphviz
 
       - name: Run tests (ubuntu)
         if: startsWith(matrix.platform, 'ubuntu')

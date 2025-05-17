@@ -87,6 +87,7 @@ jobs:
       - name: Run tests (ubuntu)
         if: startsWith(matrix.platform, 'ubuntu')
         run: >-
+          sudo apt install -y libvips
           pipx run --python '${{ steps.setup-python.outputs.python-path }}'
           tox -e platform-ubuntu --installpkg '${{ needs.prepare.outputs.wheel-distribution }}'
           -- -rFEx --durations 10 --color yes  # pytest args

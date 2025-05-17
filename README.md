@@ -30,7 +30,7 @@ SPACEc CPU
     conda create -n spacec python==3.10
     conda activate spacec
 
-    # Install dependencies via conda.
+    # Install non-Python dependencies via conda
     conda install -c conda-forge graphviz libvips openslide
 
     # Install spacec
@@ -42,53 +42,32 @@ SPACEc CPU
 SPACEc GPU
 
 ```bash
-    # Set environment variables
+    # Install CUDA
     conda install conda-forge::cudatoolkit=11.2.2 cudnn=8.1.0.77 -y
-    # Set environment variables for the conda environment
+    # Set environment variables for Tensorflow to find CUDA libraries
     mkdir -p $CONDA_PREFIX/etc/conda/activate.d && \
-    echo -e 'export PATH=$CONDA_PREFIX/bin:$PATH\nexport LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh && \
-    chmod +x $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
-
-    # Ensure package compatibility
-    # Note: Ignore dependency issues for now (seaborn)!
-    pip install protobuf==3.19.6 tensorflow-gpu==2.8.0 # numpy==1.24
-
-    # If Pytorch does not find the GPU try:
-    # pip install torch==1.12.0+cu113 torchvision==0.13.0+cu113 torchaudio==0.12.0 --extra-index-url https://download.pytorch.org/whl/cu113
-
-    # restart the environment to reload PATH variable
-    conda deactivate
-    conda activate spacec
+        echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' \
+        > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
 ```
 
-1. For GPU-accelerated clustering via RAPIDS, note that only RTX20XX or better GPUs are supported (optional). More information on rapids-singlecell are available here: https://rapids-singlecell.readthedocs.io/en/latest/Installation.html
+1. OPTIONAL: For GPU-accelerated clustering via RAPIDS run the following.
+    Note that only RTX20XX or better GPUs are supported.
+    More information on rapids-singlecell are available here: https://rapids-singlecell.readthedocs.io/en/latest/Installation.html
 ```bash
-    pip install 'rapids-singlecell[rapids11]' --extra-index-url=https://pypi.nvidia.com #CUDA11.X
-    # pip install 'rapids-singlecell[rapids12]' --extra-index-url=https://pypi.nvidia.com #CUDA12
+    pip install spacec[rapids] --extra-index-url=https://pypi.nvidia.com
 ```
 
-2. To run STELLAR (optional).
+2. OPTIONAL: To use STELLAR run the following:
 ```bash
-    # more information please refer to https://pytorch-geometric.readthedocs.io/en/2.1.0/notes/installation.html
-    pip install torch==1.12.0+cu113 torchvision==0.13.0+cu113 torchaudio==0.12.0 --extra-index-url https://download.pytorch.org/whl/cu113
-    pip install torch-scatter==2.1.0 torch-sparse==0.6.16 torch-cluster==1.6.0 torch-spline-conv==1.2.1 torch-geometric==2.2.0 -f https://data.pyg.org/whl/torch-1.12.0+cu113.html
-    # conda install pyvips  # if you get the error "OSError: cannot load library 'libvips.so.42'"
+    pip install spacec[stellar] \
+        --extra-index-url https://download.pytorch.org/whl/cu113 \
+        -f https://data.pyg.org/whl/torch-1.12.0+cu113.html
 ```
 
-<!-- Martin: I don't think this is required. -->
-3. Reinstall SPACEc to be compatible with the GPU setting
-```bash
-    # Install spacec
-    pip install spacec
-```
-
-4. Test if SPACEc loads and if your GPU is visible if you installed the GPU version. In Python:
-    ```python
-    import spacec as sp
-    sp.hf.check_for_gpu()
+3. Test if SPACEc loads and if your GPU is visible:
+    ```bash
+    python -c "import spacec as sp; sp.hf.check_for_gpu()"
     ```
-
-* ⚠️ **IMPORTANT**: always import `spacec` first before importing any other packages
 
 </details>
 
@@ -119,7 +98,6 @@ SPACEc CPU:
 ```
 SPACEc GPU: Mac GPU support is currently only supported for Tensorflow based methods not PyTorch, we recommend you use Linux system for full GPU acceleration.
 
-* ⚠️ **IMPORTANT**: always import `spacec` first before importing any other packages
 </details>
 
 <details><summary>Windows</summary>
@@ -177,7 +155,6 @@ Test if SPACEc loads and if your GPU is visible if you installed the GPU version
     sp.hf.check_for_gpu()
 ```
 
-* ⚠️ **IMPORTANT**: always import `spacec` first before importing any other packages
 </details>
 
 

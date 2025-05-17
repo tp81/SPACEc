@@ -15,20 +15,18 @@ except PackageNotFoundError:  # pragma: no cover
 finally:
     del version, PackageNotFoundError
 
-# TODO: hacky!
+# TODO: hacky! but apparently this is not required anymore?
 # NOTE: Be aware of potential side-effects: but that may cause crashes or silently produce incorrect results.
 # sources:
 # - https://stackoverflow.com/questions/53014306/error-15-initializing-libiomp5-dylib-but-found-libiomp5-dylib-already-initial
 # - https://stackoverflow.com/questions/55714135/how-can-i-fix-an-omp-error-15-initializing-libiomp5-dylib-but-found-libomp
-import os
+# import os
+# os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
 from . import helperfunctions as hf
 from . import plotting as pl
 from . import preprocessing as pp
 from . import tools as tl
-
-# os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
-
 
 __all__ = [
     "__version__",

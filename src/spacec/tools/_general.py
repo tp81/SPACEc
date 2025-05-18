@@ -81,12 +81,13 @@ from scipy.spatial.distance import cdist
 from shapely.geometry import MultiPolygon
 from skimage.io import imsave
 from skimage.segmentation import find_boundaries
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import HDBSCAN, MiniBatchKMeans
 from sklearn.cross_decomposition import CCA
 from sklearn.metrics import classification_report, f1_score, pairwise_distances
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import NearestNeighbors
-from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+from sklearn.svm import SVC, LinearSVC
 from tqdm import tqdm
 from yellowbrick.cluster import KElbowVisualizer
 
@@ -2105,7 +2106,10 @@ def patch_proximity_analysis(
 
 
 def stellar_get_edge_index(
-    pos, distance_thres, max_memory_usage=1.6e10, chunk_size=1000
+    pos,
+    distance_thres,
+    max_memory_usage=1.6e10,
+    chunk_size=5000,
 ):
     """
     Constructs edge indexes in one region based on pairwise distances and a distance threshold.
@@ -2120,9 +2124,7 @@ def stellar_get_edge_index(
     edge_list (list): A list of lists where each inner list contains two indices representing an edge.
     """
     n_samples = pos.shape[0]
-    estimated_memory_usage = (
-        n_samples * n_samples * 8
-    )  # Estimate memory usage for the distance matrix (float64)
+    estimated_memory_usage = n_samples * n_samples * 8  # ~float64 for distance matrix
 
     if estimated_memory_usage > max_memory_usage:
         print("Processing will be done in chunks to save memory.")
@@ -2147,34 +2149,98 @@ def stellar_get_edge_index(
 def adata_stellar(
     adata_train,
     adata_unannotated,
-    celltype_col="coarse_anno3",
+    celltype_col="cell_type",
+    region_column=None,
     x_col="x",
     y_col="y",
     sample_rate=0.5,
     distance_thres=50,
     epochs=50,
+    num_seed_class=3,
     key_added="stellar_pred",
     STELLAR_path="",
+    max_memory_usage=1.6e10,
+    chunk_size=5000,
+    wd=5e-2,
+    lr=1e-3,
+    seed=1,
+    batch_size=1,
 ):
     """
-    Applies the STELLAR algorithm to the given annotated and unannotated data.
+    Apply the STELLAR algorithm to annotated and unannotated spatial single-cell data.
 
-    Parameters:
-    adata_train (AnnData): The annotated data.
-    adata_unannotated (AnnData): The unannotated data.
-    celltype_col (str, optional): The column name for cell types in the annotated data. Defaults to 'coarse_anno3'.
-    x_col (str, optional): The column name for x coordinates in the data. Defaults to 'x'.
-    y_col (str, optional): The column name for y coordinates in the data. Defaults to 'y'.
-    sample_rate (float, optional): The rate at which to sample the training data. Defaults to 0.5.
-    distance_thres (int, optional): The distance threshold for constructing edge indexes. Defaults to 50.
-    key_added (str, optional): The key to be added to the unannotated data's obs dataframe for the predicted results. Defaults to 'stellar_pred'.
+    This function processes the input AnnData objects by preparing the training data,
+    constructing graph edges based on spatial coordinates, and then running the STELLAR
+    algorithm for label prediction. When a region column is provided, the edge computations
+    are performed for each region separately and the resulting edges are concatenated.
 
-    Returns:
-    adata (AnnData): The unannotated data with the added key for the predicted results.
+    Parameters
+    ----------
+    adata_train : AnnData
+        The annotated single-cell data used for training.
+    adata_unannotated : AnnData
+        The unannotated single-cell data for which predictions are desired.
+    celltype_col : str, optional
+        Column name in adata_train.obs that contains the cell type labels, by default "cell_type".
+    region_column : str or None, optional
+        Column name to partition data into regions. If not None, edges are computed independently
+        per region, by default None.
+    x_col : str, optional
+        Column name in the AnnData objects denoting the x-coordinate, by default "x".
+    y_col : str, optional
+        Column name in the AnnData objects denoting the y-coordinate, by default "y".
+    sample_rate : float, optional
+        The rate at which to sample the training data (between 0 and 1), by default 0.5.
+    distance_thres : int, optional
+        Distance threshold (in the same unit as the spatial coordinates) used to determine whether
+        a pair of cells is connected, by default 50.
+    epochs : int, optional
+        Number of training epochs for the STELLAR model, by default 50.
+    num_seed_class : int, optional
+        Number of seed classes, which are appended to the number of unique cell types, by default 3.
+    key_added : str, optional
+        Key under which the predicted labels will be stored in adata_unannotated.obs, by default "stellar_pred".
+    STELLAR_path : str, optional
+        Filesystem path to the STELLAR repository. This path is added to sys.path, by default "".
+    max_memory_usage : float, optional
+        Maximum allowable memory usage in bytes when computing pairwise distances; if exceeded,
+        the computation will be done in chunks, by default 1.6e10.
+    chunk_size : int, optional
+        The size of chunks to use for edge computation when memory usage is high, by default 5000.
+    wd : float, optional
+        Weight decay parameter for model optimization, by default 5e-2.
+    lr : float, optional
+        Learning rate for model training, by default 1e-3.
+    seed : int, optional
+        Seed used for reproducibility, by default 1.
+    batch_size : int, optional
+        Batch size for model training, by default 1.
+
+    Returns
+    -------
+    AnnData
+        The unannotated AnnData object with an additional observation column (key_added) containing
+        the predicted cell type labels.
+
+    Notes
+    -----
+    The function performs the following steps:
+      1. Prints a citation reminder for the STELLAR algorithm.
+      2. Sets up the model arguments by parsing command-line-like arguments.
+      3. Prepares the training data by concatenating coordinate information and cell types, and
+         builds a mapping between original and sampled indices.
+      4. Computes graph edges either globally or per region (if region_column is provided) using the
+         provided spatial coordinates and distance threshold.
+      5. Constructs a GraphDataset and runs the STELLAR algorithm on it.
+      6. Returns the modified adata_unannotated with predictions stored in obs[key_added].
+
+    The function assumes that helper functions (e.g., stellar_get_edge_index) and necessary modules,
+    including torch, argparse, and dataset utility modules, are available in the environment.
     """
-
     print(
-        "Please consider to cite the following paper when using STELLAR: Brbić, M., Cao, K., Hickey, J.W. et al. Annotation of spatially resolved single-cell data with STELLAR. Nat Methods 19, 1411–1418 (2022). https://doi.org/10.1038/s41592-022-01651-8"
+        "Please consider to cite the following paper when using STELLAR: "
+        "Brbić, M., Cao, K., Hickey, J.W. et al. Annotation of spatially resolved single-cell data with STELLAR. "
+        "Nat Methods 19, 1411–1418 (2022). https://doi.org/10.1038/s41592-022-01651-8"
     )
 
     sys.path.append(str(STELLAR_path))
@@ -2183,86 +2249,306 @@ def adata_stellar(
     from utils import prepare_save_dir
 
     parser = argparse.ArgumentParser(description="STELLAR")
-    parser.add_argument(
-        "--seed", type=int, default=1, metavar="S", help="random seed (default: 1)"
-    )
+    parser.add_argument("--seed", type=int, default=seed, metavar="S")
     parser.add_argument("--name", type=str, default="STELLAR")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--wd", type=float, default=5e-2)
-    parser.add_argument("--input-dim", type=int, default=26)
+    parser.add_argument("--lr", type=float, default=lr)
+    parser.add_argument("--wd", type=float, default=wd)
+    # Don't set input_dim here - let STELLAR set it from the dataset
     parser.add_argument("--num-heads", type=int, default=13)
-    parser.add_argument("--num-seed-class", type=int, default=3)
-    parser.add_argument("--sample-rate", type=float, default=0.5)
-    parser.add_argument(
-        "-b", "--batch-size", default=1, type=int, metavar="N", help="mini-batch size"
-    )
+    parser.add_argument("--num-seed-class", type=int, default=num_seed_class)
+    parser.add_argument("--sample-rate", type=float, default=sample_rate)
+    parser.add_argument("-b", "--batch-size", default=batch_size, type=int, metavar="N")
     parser.add_argument("--distance_thres", default=50, type=int)
     parser.add_argument("--savedir", type=str, default="./")
+
     args = parser.parse_args(args=[])
     args.cuda = torch.cuda.is_available()
     args.device = torch.device("cuda" if args.cuda else "cpu")
-    args.epochs = 50
+    args.epochs = epochs
+    args.distance_thres = distance_thres
+    # Set the number of heads based on the number of cell types (IMPORTANT)
+    args.num_heads = len(adata_train.obs[celltype_col].unique()) + num_seed_class
 
-    # prepare input data
     print("Preparing input data")
+    # Create a mapping between original cell indices and sampled indices
     train_df = adata_train.to_df()
-
-    # add to train_df
     positions_celltype = adata_train.obs[[x_col, y_col, celltype_col]]
-
     train_df = pd.concat([train_df, positions_celltype], axis=1)
 
-    train_df = train_df.sample(n=round(sample_rate * len(train_df)), random_state=1)
+    # Create a key to track the original indices before sampling
+    train_df["original_idx"] = np.arange(len(train_df))
+    # train_df = train_df.sample(n=round(sample_rate * len(train_df)), random_state=1)
 
-    train_X = train_df.iloc[:, 0:-3].values
+    # Get the mapping from sampled indices to original indices
+    sampled_to_original = dict(enumerate(train_df["original_idx"].values))
+    original_to_sampled = {v: k for k, v in sampled_to_original.items()}
+
+    # Remove the helper column
+    train_df = train_df.drop(columns=["original_idx"])
+
+    train_X = train_df.iloc[:, :-3].values
     test_X = adata_unannotated.to_df().values
 
-    train_y = train_df[celltype_col].str.lower()
-    train_y
+    # DO NOT convert to lowercase - keep original cell type labels
+    train_y = train_df[celltype_col].values
 
-    labeled_pos = train_df.iloc[
-        :, -3:-1
-    ].values  # x,y coordinates, indexes depend on specific datasets
+    labeled_pos = train_df.iloc[:, -3:-1].values
     unlabeled_pos = adata_unannotated.obs[[x_col, y_col]].values
 
-    cell_types = np.sort(list(set(train_y))).tolist()
-    cell_types
+    # Print information about the data to help with debugging
+    print(f"Number of unique cell types: {len(np.unique(train_y))}")
+    print(f"Cell types: {np.unique(train_y)[:10]}")
 
+    cell_types = np.sort(list(set(train_y))).tolist()
     cell_type_dict = {}
     inverse_dict = {}
+    for i, t in enumerate(cell_types):
+        cell_type_dict[t] = i
+        inverse_dict[i] = t
 
-    for i, cell_type in enumerate(cell_types):
-        cell_type_dict[cell_type] = i
-        inverse_dict[i] = cell_type
+    # Print dictionaries to verify proper mapping
+    print(f"Cell type mapping size: {len(cell_type_dict)}")
+    print(f"First 3 mappings: {list(cell_type_dict.items())[:3]}")
 
     train_y = np.array([cell_type_dict[x] for x in train_y])
 
-    labeled_edges = stellar_get_edge_index(labeled_pos, distance_thres=distance_thres)
-    unlabeled_edges = stellar_get_edge_index(
-        unlabeled_pos, distance_thres=distance_thres
-    )
+    # If region_column is provided, compute edges per region and concatenate
+    if region_column is not None:
+        labeled_edges_list = []
+        unlabeled_edges_list = []
+        train_regions_map = {}  # To map region cells to train_df indices
 
-    # build dataset
+        # Create a mapping between original cells and their position in the sampled data
+        sampled_cells = set(train_df.index)
+
+        # Get unique regions
+        unique_regions_train = adata_train.obs[region_column].unique()
+        unique_regions_unannot = adata_unannotated.obs[region_column].unique()
+
+        # For each region in annotated data
+        print("Processing labeled data")
+        for region in unique_regions_train:
+            print(f"Processing region: {region}")
+            # Get cells in this region that are also in the sampled training data
+            region_mask_full = adata_train.obs[region_column] == region
+            # Extract positions for just those cells that are in the training data
+            region_cells = adata_train[region_mask_full].obs_names
+            region_sampled_cells = [
+                cell for cell in region_cells if cell in sampled_cells
+            ]
+
+            if len(region_sampled_cells) < 2:
+                print(
+                    f"  Skipping region {region}: too few sampled cells ({len(region_sampled_cells)})"
+                )
+                continue
+
+            # Get positions of sampled cells in this region
+            region_pos = train_df.loc[region_sampled_cells, [x_col, y_col]].values
+
+            # Create mapping from local indices to global training indices
+            local_to_global = {
+                i: original_to_sampled.get(adata_train.obs_names.get_loc(cell), None)
+                for i, cell in enumerate(region_sampled_cells)
+            }
+            local_to_global = {
+                k: v for k, v in local_to_global.items() if v is not None
+            }
+
+            if len(local_to_global) < 2:
+                print(
+                    f"  Skipping region {region}: too few cells with valid mapping ({len(local_to_global)})"
+                )
+                continue
+
+            # Calculate edges using local indices
+            region_edges = stellar_get_edge_index(
+                region_pos,
+                distance_thres=distance_thres,
+                max_memory_usage=max_memory_usage,
+                chunk_size=chunk_size,
+            )
+
+            # Convert to global indices for the training set
+            valid_edges = []
+            for edge in region_edges:
+                src, dst = edge
+                if src in local_to_global and dst in local_to_global:
+                    valid_edges.append([local_to_global[src], local_to_global[dst]])
+
+            if valid_edges:
+                labeled_edges_list.extend(valid_edges)
+
+        # For each region in unannotated data
+        print("Processing unlabeled data")
+        for region in unique_regions_unannot:
+            print(f"Processing region: {region}")
+            region_mask = adata_unannotated.obs[region_column] == region
+            region_indices = np.where(region_mask)[0]
+
+            if len(region_indices) < 2:
+                print(
+                    f"  Skipping region {region}: too few cells ({len(region_indices)})"
+                )
+                continue
+
+            # Get positions
+            region_pos = adata_unannotated.obs.loc[region_mask, [x_col, y_col]].values
+
+            # Calculate edges
+            region_edges = stellar_get_edge_index(
+                region_pos,
+                distance_thres=distance_thres,
+                max_memory_usage=max_memory_usage,
+                chunk_size=chunk_size,
+            )
+
+            # Map local indices to global indices
+            valid_edges = []
+            for edge in region_edges:
+                src_local, dst_local = edge
+                if src_local < len(region_indices) and dst_local < len(region_indices):
+                    src_global = region_indices[src_local]
+                    dst_global = region_indices[dst_local]
+                    if src_global < len(test_X) and dst_global < len(test_X):
+                        valid_edges.append([src_global, dst_global])
+
+            if valid_edges:
+                unlabeled_edges_list.extend(valid_edges)
+
+        # Convert edge lists to arrays
+        if labeled_edges_list:
+            labeled_edges = np.array(labeled_edges_list)
+            # Final sanity check for labeled edges
+            max_allowed_idx = len(train_X) - 1
+            valid_mask = (labeled_edges[:, 0] <= max_allowed_idx) & (
+                labeled_edges[:, 1] <= max_allowed_idx
+            )
+            labeled_edges = labeled_edges[valid_mask]
+        else:
+            labeled_edges = np.array([]).reshape(0, 2)
+
+        if unlabeled_edges_list:
+            unlabeled_edges = np.array(unlabeled_edges_list)
+            # Final sanity check for unlabeled edges
+            max_allowed_idx = len(test_X) - 1
+            valid_mask = (unlabeled_edges[:, 0] <= max_allowed_idx) & (
+                unlabeled_edges[:, 1] <= max_allowed_idx
+            )
+            unlabeled_edges = unlabeled_edges[valid_mask]
+        else:
+            unlabeled_edges = np.array([]).reshape(0, 2)
+
+        print(f"Final labeled edges: {labeled_edges.shape[0]}")
+        print(f"Final unlabeled edges: {unlabeled_edges.shape[0]}")
+    else:
+        # Standard approach with global edge indices
+        labeled_edges = stellar_get_edge_index(
+            labeled_pos,
+            distance_thres=distance_thres,
+            max_memory_usage=max_memory_usage,
+            chunk_size=chunk_size,
+        )
+        unlabeled_edges = stellar_get_edge_index(
+            unlabeled_pos,
+            distance_thres=distance_thres,
+            max_memory_usage=max_memory_usage,
+            chunk_size=chunk_size,
+        )
+
+        # Convert to numpy arrays
+        labeled_edges = np.array(labeled_edges)
+        unlabeled_edges = np.array(unlabeled_edges)
+
+        # Final sanity checks
+        max_train_idx = len(train_X) - 1
+        max_test_idx = len(test_X) - 1
+
+        valid_mask = (labeled_edges[:, 0] <= max_train_idx) & (
+            labeled_edges[:, 1] <= max_train_idx
+        )
+        labeled_edges = labeled_edges[valid_mask]
+
+        valid_mask = (unlabeled_edges[:, 0] <= max_test_idx) & (
+            unlabeled_edges[:, 1] <= max_test_idx
+        )
+        unlabeled_edges = unlabeled_edges[valid_mask]
+
     print("Building dataset")
+    # Debug info to verify edge indices are within bounds
+    print(f"Training data shape: {train_X.shape}, max label index: {len(train_X)-1}")
+    print(f"Testing data shape: {test_X.shape}, max label index: {len(test_X)-1}")
+    if len(labeled_edges) > 0:
+        print(f"Max labeled edge index: {np.max(labeled_edges)}")
+    if len(unlabeled_edges) > 0:
+        print(f"Max unlabeled edge index: {np.max(unlabeled_edges)}")
+
+    # Make sure all edge indices are within bounds
+    if len(labeled_edges) > 0:
+        max_idx = len(train_X) - 1
+        valid_mask = np.all(labeled_edges <= max_idx, axis=1)
+        if not np.all(valid_mask):
+            print(f"Removing {(~valid_mask).sum()} out-of-bounds labeled edges")
+            labeled_edges = labeled_edges[valid_mask]
+
+    if len(unlabeled_edges) > 0:
+        max_idx = len(test_X) - 1
+        valid_mask = np.all(unlabeled_edges <= max_idx, axis=1)
+        if not np.all(valid_mask):
+            print(f"Removing {(~valid_mask).sum()} out-of-bounds unlabeled edges")
+            unlabeled_edges = unlabeled_edges[valid_mask]
+
+    # Ensure we have at least some edges - STELLAR will fail without edges
+    if len(labeled_edges) == 0 or len(unlabeled_edges) == 0:
+        print(
+            "WARNING: No edges found for labeled or unlabeled data - STELLAR requires edges for both datasets"
+        )
+        if len(labeled_edges) == 0:
+            print("Adding token edge to labeled data")
+            labeled_edges = np.array([[0, min(1, len(train_X) - 1)]])
+        if len(unlabeled_edges) == 0:
+            print("Adding token edge to unlabeled data")
+            unlabeled_edges = np.array([[0, min(1, len(test_X) - 1)]])
+
+    # Build dataset
     dataset = GraphDataset(train_X, train_y, test_X, labeled_edges, unlabeled_edges)
 
-    # run stellar
+    # IMPORTANT: Set input dimension correctly from dataset
+    args.input_dim = train_X.shape[1]
+    print(f"Setting input dimension to: {args.input_dim}")
+
     print("Running STELLAR")
     stellar = STELLAR(args, dataset)
-    stellar.train()
-    _, results = stellar.pred()
 
+    # Additional diagnostic info
+    model_params = sum(p.numel() for p in stellar.model.parameters())
+    print(f"Model has {model_params} parameters")
+
+    # Execute training
+    stellar.train()
+
+    # Get predictions
+    uncertainty, results = stellar.pred()
+    print(f"Mean prediction uncertainty: {uncertainty:.4f}")
+
+    # Count predictions per class to check for uniformity
+    unique_preds, counts = np.unique(results, return_counts=True)
+    print("Prediction distribution:")
+    for pred, count in zip(unique_preds, counts):
+        print(f"Class {pred}: {count} cells ({count/len(results)*100:.2f}%)")
+
+    # Convert numerical predictions back to string labels
     results = results.astype("object")
     for i in range(len(results)):
         if results[i] in inverse_dict.keys():
             results[i] = inverse_dict[results[i]]
-    adata_unannotated.obs[key_added] = pd.Categorical(results)
+        else:
+            # Handle new/unseen classes
+            results[i] = f"New_Class_{results[i]}"
 
-    # make stellar_pred a string
-    adata_unannotated.obs["stellar_pred"] = adata_unannotated.obs[
-        "stellar_pred"
-    ].astype(str)
+    adata_unannotated.obs[key_added] = pd.Categorical(results)
+    adata_unannotated.obs[key_added] = adata_unannotated.obs[key_added].astype(str)
 
     return adata_unannotated
 
@@ -2270,80 +2556,113 @@ def adata_stellar(
 def ml_train(
     adata_train,
     label,
-    test_size=0.33,
+    test_size=0.2,
     random_state=0,
-    model="svm",
-    nan_policy_y="raise",
+    nan_policy_y="omit",
+    mode="accurate_SVC",  # 'accurate_SVC' or 'fast_SVC' or 'knn'
     showfig=True,
-    figsize=(10, 8),
+    figsize=(8, 6),
+    n_neighbors=5,  # Number of neighbors for KNN
 ):
     """
-    Train a svm model on the provided data.
+    Train a classifier (SVC, LinearSVC, or KNN) on the data.
 
     Parameters
     ----------
-    adata_train : AnnData
-        The training data as an AnnData object.
+    adata_train : anndata.AnnData
+        The AnnData object containing the training data. The input features are expected in adata_train.X,
+        and the target labels in adata_train.obs[label].
     label : str
-        The label to predict.
+        The column name in adata_train.obs to use as the target variable.
     test_size : float, optional
-        The proportion of the dataset to include in the test split, by default 0.33.
+        The proportion of the dataset to include in the test split. Default is 0.2.
     random_state : int, optional
-        The seed used by the random number generator, by default 0.
-    model : str, optional
-        The type of model to train, by default "svm".
-    nan_policy_y : str, optional
-        How to handle NaNs in the label, by default "raise". Can be either 'omit' or 'raise'.
+        Seed for the random number generator. Default is 0.
+    nan_policy_y : {'omit', 'raise'}, optional
+        Policy for handling NaNs in the target variable. 'omit' removes NaNs, 'raise' raises an error.
+        Default is 'omit'.
+    mode : {'accurate_SVC', 'fast_SVC', 'knn'}, optional
+        The type of classifier to use.
+        - 'accurate_SVC': Uses SVC with probability=True (slower, provides predict_proba).
+        - 'fast_SVC': Uses LinearSVC with CalibratedClassifierCV (faster, optional predict_proba).
+        - 'knn': Uses KNeighborsClassifier with specified n_neighbors.
+        Default is 'accurate_SVC'.
     showfig : bool, optional
-        Whether to show the confusion matrix as a heatmap, by default True.
+        Whether to display a heatmap of the classification report. Default is True.
+    figsize : tuple, optional
+        Size of the figure if showfig is True. Default is (8, 6).
+    n_neighbors : int, optional
+        Number of neighbors for KNN classifier. Default is 5.
 
     Returns
     -------
-    SVC
-        The trained Support Vector Classifier model.
+    svc : sklearn.base.BaseEstimator
+        The trained classifier model. For 'accurate_SVC' and 'fast_SVC', the model supports predict_proba.
+        For 'knn', only predict is available.
 
     Raises
     ------
     ValueError
-        If `nan_policy_y` is not 'omit' or 'raise'.
-    """
-    X = pd.DataFrame(adata_train.X)
-    y = adata_train.obs[label].values
+        If `mode` is not one of the allowed options, or if `nan_policy_y` is not 'omit' or 'raise'.
 
+    Notes
+    -----
+    - The function handles NaNs in the target variable based on `nan_policy_y`.
+    - For 'accurate_SVC', the classifier provides `predict_proba` for probability estimates.
+    - For 'fast_SVC', the classifier uses LinearSVC with calibration for `predict_proba`.
+    - For 'knn', the classifier uses KNeighborsClassifier with the specified `n_neighbors`.
+    - The classification report is displayed as a heatmap if `showfig` is True.
+    - The function prints progress messages (e.g., "Preparing training data!", "Training now!", etc.).
+    """
+    print("Preparing training data!")
+    X = adata_train.X
+    if not isinstance(X, np.ndarray):
+        X = X.toarray()
+    y = adata_train.obs[label].values
     if nan_policy_y == "omit":
-        y_msk = ~y.isna()
+        y_msk = ~pd.isna(y)  # <-- pd.isna works fine with mixed types
         X = X[y_msk]
         y = y[y_msk]
-    elif nan_policy_y == "raise":
-        pass
-    else:
+    elif nan_policy_y != "raise":
         raise ValueError("nan_policy_y must be either 'omit' or 'raise'")
-
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
-
-    print(y.unique().sort_values())
-
+    print("Unique labels:", np.unique(y))  # Adjusted for clarity
     print("Training now!")
-    svc = SVC(kernel="linear", probability=True)
+    if mode == "accurate_SVC":
+        svc = SVC(kernel="linear", probability=True)  # SVC with probability
+    elif mode == "knn":
+        print("Using KNN classifier with n_neighbors = ", n_neighbors)
+        svc = KNeighborsClassifier(n_neighbors=n_neighbors)
+    elif mode == "fast_SVC":
+        base_svc = LinearSVC()
+        svc = CalibratedClassifierCV(
+            base_svc
+        )  # CalibratedClassifierCV to add predict_proba
+    else:
+        raise ValueError("mode must be 'accurate_SVC', 'fast_SVC', or 'knn'")
     svc.fit(X_train, y_train)
-    pred = []
-    y_prob = svc.predict_proba(X_test)
-    y_prob = pd.DataFrame(y_prob)
-    y_prob.columns = svc.classes_
-
-    svm_label = y_prob.idxmax(axis=1, skipna=True)
-    target_names = svc.classes_
     print("Evaluating now!")
+    # Predict probability only for 'accurate' mode
+    if mode == "accurate_SVC":
+        y_prob = svc.predict_proba(X_test)
+        y_prob = pd.DataFrame(y_prob, columns=svc.classes_)
+        svm_label = y_prob.idxmax(axis=1)
+    elif mode == "knn":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    elif mode == "fast_SVC":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    # Generate classification report
+    target_names = svc.classes_
     svm_eval = classification_report(
         y_true=y_test, y_pred=svm_label, target_names=target_names, output_dict=True
     )
     if showfig:
         plt.figure(figsize=figsize)
         sns.heatmap(pd.DataFrame(svm_eval).iloc[:-1, :].T, annot=True)
+        plt.title(f"Classification Report ({mode})")
         plt.show()
-
     return svc
 
 
@@ -3576,11 +3895,15 @@ def identify_points_in_proximity(
     if len(result_list) > 0:
         result = pd.concat(result_list)
     else:
-        result = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+        result = pd.DataFrame(
+            columns=[x_column, y_column, "patch_id", identification_column]
+        )
     if len(outline_list) > 0:
         outlines = pd.concat(outline_list)
     else:
-        outlines = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+        outlines = pd.DataFrame(
+            columns=[x_column, y_column, "patch_id", identification_column]
+        )
     return result, outlines
 
 
@@ -3686,9 +4009,9 @@ def process_cluster(args, nbrs, unique_clusters):
         concavity=concavity,
     )
     # Get hull points from the DataFrame
-    hull_points = pd.DataFrame(points[idxes], columns=["x", "y"])
+    hull_points = pd.DataFrame(points[idxes], columns=[x_column, y_column])
     # Find nearest neighbors of hull points in the original DataFrame
-    distances, indices = nbrs.kneighbors(hull_points[["x", "y"]])
+    distances, indices = nbrs.kneighbors(hull_points[[x_column, y_column]])
     hull_nearest_neighbors = df.iloc[indices.flatten()]
 
     # Convert radius to a list if it's a single value
@@ -3698,9 +4021,9 @@ def process_cluster(args, nbrs, unique_clusters):
         radius_list = radius
 
     # Extract hull points coordinates
-    hull_coords = hull_nearest_neighbors[["x", "y"]].values
+    hull_coords = hull_nearest_neighbors[[x_column, y_column]].values
     # Calculate distances from all points in full_df to all hull points
-    distances = cdist(full_df[["x", "y"]].values, hull_coords)
+    distances = cdist(full_df[[x_column, y_column]].values, hull_coords)
 
     # Process each radius
     all_prox_points = []

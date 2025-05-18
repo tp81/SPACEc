@@ -27,11 +27,8 @@ SPACEc CPU
 
 ```bash
     # Create conda environment
-    conda create -n spacec python==3.10
+    conda create -n spacec python==3.10 graphviz libvips openslide
     conda activate spacec
-
-    # Install non-Python dependencies via conda
-    conda install -c conda-forge graphviz libvips openslide
 
     # Install spacec
     pip install spacec
@@ -78,15 +75,9 @@ SPACEc GPU
 SPACEc CPU:
 
 ```bash
-    conda create -n spacec
+    # Create conda environment
+    conda create -y -n spacec python==3.10 graphviz libvips openslide
     conda activate spacec
-
-    # Install Python via conda
-    conda install python==3.10
-
-    # Install dependencies via conda.
-    conda install -c conda-forge graphviz libvips openslide
-    # conda install -c conda-forge pyvips  # only required for Python 3.9
 
     # Install spacec
     pip install spacec
@@ -96,7 +87,7 @@ SPACEc CPU:
     pip install -r https://raw.githubusercontent.com/nolanlab/SPACEc/master/requirements/requirements-deepcell-mac-arm64_tf210-metal.txt
     pip install deepcell --no-deps
 ```
-SPACEc GPU: Mac GPU support is currently only supported for Tensorflow based methods not PyTorch, we recommend you use Linux system for full GPU acceleration.
+SPACEc GPU: Mac GPU support is currently only supported for Tensorflow based methods but not PyTorch. We recommend you use Linux system for full GPU acceleration.
 
 </details>
 

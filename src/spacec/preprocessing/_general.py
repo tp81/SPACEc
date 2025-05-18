@@ -536,7 +536,7 @@ class ImageProcessor:
         if left or right or up or down:
             adjacency_matrix[int(origin_mask - 1), int(origin_mask - 1)] += 1
 
-    def compute_channel_means_sums_compensated(self, image):
+    def compute_channel_means_sums_compensated(self, image, device=None):
         """
         Computes and compensates channel means and sums for each cell in a multi-channel image using
         vectorized operations and GPU acceleration when available.
@@ -551,6 +551,9 @@ class ImageProcessor:
         image : np.ndarray
             A 3D array of shape (height, width, n_channels) containing the multi-channel image data.
             Values should be in float32 format.
+        device: str|None
+            None (default) will select the compute device automatically.
+            Can be forced to `cuda`, `mps`, or `cpu`.
 
         Returns
         -------
@@ -674,11 +677,12 @@ class ImageProcessor:
         np.fill_diagonal(adj, 1)
 
         # Run the least squares solver using torch on CUDA if available, otherwise use MPS on Mac, else CPU.
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else ("mps" if torch.backends.mps.is_available() else "cpu")
-        )
+        if device is None:
+            device = torch.device(
+                "cuda"
+                if torch.cuda.is_available()
+                else ("mps" if torch.backends.mps.is_available() else "cpu")
+            )
         adjacency_matrix_torch = torch.from_numpy(adj).to(device)
         means_torch = torch.from_numpy(means).to(device)
         results_torch = torch.linalg.lstsq(adjacency_matrix_torch, means_torch).solution
@@ -690,7 +694,7 @@ class ImageProcessor:
         return compensated_means, means, channel_counts[:, 0]
 
 
-def compensate_cell_matrix(df, image_dict, masks, overwrite=True):
+def compensate_cell_matrix(df, image_dict, masks, overwrite=True, device=None):
     """
     Compensate cell matrix by computing channel means and sums.
 
@@ -704,6 +708,9 @@ def compensate_cell_matrix(df, image_dict, masks, overwrite=True):
         3D numpy array containing masks for each cell.
     overwrite : bool, optional
         If True, overwrite existing columns in df. If False, add new columns to df. Default is True.
+    device: str|None
+        None (default) will select the compute device automatically (for `compute_channel_means_sums_compensated`).
+        Can be forced to `cuda`, `mps`, or `cpu`.
 
     Returns
     -------
@@ -737,7 +744,7 @@ def compensate_cell_matrix(df, image_dict, masks, overwrite=True):
         compensated_means,
         means,
         channel_counts,
-    ) = processor.compute_channel_means_sums_compensated(image)
+    ) = processor.compute_channel_means_sums_compensated(image, device=device)
 
     # Get the keys
     keys = [

@@ -4321,154 +4321,6 @@ def BC_projection(
         plt.show()
 
 
-def ppa_res_donut(
-    adata,
-    cat_col,
-    palette=None,
-    key_names="ppa_result",
-    radii=[1, 2, 3, 4, 5],
-    unit="µm",
-    figsize=(10, 10),
-    add_guides=True,
-    text="example CN",
-    label_color="black",
-    rand_seed=1,
-    subset_column=None,
-    subset_condition=None,
-    title="Title",
-    savefig=False,
-    output_fname="",
-    output_dir="./",
-):
-    # plotting
-    key_names = key_names[::-1]
-    plt.figure(figsize=figsize)
-
-    if add_guides == True:
-        # add grid lines
-        plt.plot([0, 0], [1.05, -1.05], color="black", alpha=0.3, zorder=-1)
-        plt.plot([1.05, -1.05], [0, 0], color="black", alpha=0.3, zorder=-1)
-        # add diagonal lines
-        for angle in [45, -45]:
-            x_new = 1.05 * np.cos(np.radians(angle))
-            y_new = 1.05 * np.sin(np.radians(angle))
-            plt.plot(
-                [-x_new, x_new], [-y_new, y_new], color="black", alpha=0.3, zorder=-1
-            )
-
-    # generate reproducable colors if no palette is provided
-    if palette is None:
-        if cat_col + "_colors" not in adata.uns.keys():
-            ct_colors = hf_generate_random_colors(
-                len(adata.obs[cat_col].unique()), rand_seed=rand_seed
-            )
-            palette = dict(zip(np.sort(adata.obs[cat_col].unique()), ct_colors))
-            adata.uns[cat_col + "_colors"] = ct_colors
-        else:
-            palette = dict(
-                zip(
-                    np.sort(adata.obs[cat_col].unique()), adata.uns[cat_col + "_colors"]
-                )
-            )
-
-    for i, key_name in enumerate(key_names):
-        print(f"Key {i}: {key_name}")
-        # extract key from adata
-        region_results = adata.uns[key_name]
-
-        # test if region_results is empty
-        if region_results.shape[0] == 0:
-            print(f"Key {i} is empty.")
-            continue
-        else:
-            print(f"Key {i} has {region_results.shape[0]} rows.")
-
-            # subset by condition
-            if subset_column != None:
-                if subset_column not in region_results.columns:
-                    raise ValueError(
-                        f"Column '{subset_column}' does not exist in the DataFrame."
-                    )
-                elif subset_condition not in region_results[subset_column].unique():
-                    raise ValueError(
-                        f"Value '{subset_condition}' does not exist in the column '{subset_column}'."
-                    )
-                else:
-                    region_results = region_results[
-                        region_results[subset_column] == subset_condition
-                    ]
-
-            # calculate percentages of categories
-            percentage_list = region_results[cat_col].value_counts(normalize=True) * 100
-
-            # Check if all categories have a color in the palette
-            for category in percentage_list.index:
-                if category not in palette:
-                    raise ValueError(
-                        f"No color provided for category {category} in the palette"
-                    )
-
-            # Get the colors for the current categories from the palette
-            category_colors = [palette[category] for category in percentage_list.index]
-
-            rsed_index = len(radii) - 1 - i
-            plt.pie(
-                percentage_list, radius=(0.6 + 0.1 * rsed_index), colors=category_colors
-            )
-
-    # add labels for each distance
-    for j, percentage_list in enumerate(radii):
-        rsed_index = len(radii) - 1 - j
-        plt.text(
-            0,
-            (0.53 + 0.1 * rsed_index),
-            str(radii[rsed_index]) + unit,
-            horizontalalignment="center",
-            fontweight="bold",
-            color=label_color,
-        )
-
-    # add a circle at the center to transform it in a donut chart
-    my_circle = plt.Circle((0, 0), 0.5, color="white")
-    p = plt.gcf()
-    p.gca().add_artist(my_circle)
-
-    # add a legend based on the colors and keys in palette
-    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[key]) for key in palette]
-    plt.legend(
-        handles,
-        palette.keys(),
-        bbox_to_anchor=(0.94, 0.925),
-        loc="upper left",
-        prop={"size": 15},
-    )
-
-    # Define the maximum length of a line
-    max_line_length = 20
-
-    # Split the text into multiple lines if it's too long
-    wrapped_text = textwrap.fill(text, max_line_length)
-
-    # Add a title in the middle of the white circle
-    plt.text(
-        0,
-        0,
-        wrapped_text,
-        horizontalalignment="center",
-        verticalalignment="center",
-        fontsize=18,
-    )
-
-    plt.title(title, size=24, y=0.96)
-
-    if savefig is None:
-        pass
-    elif savefig:
-        plt.savefig(output_dir + output_fname + ".pdf", bbox_inches="tight")
-    else:
-        plt.show()
-
-
 def distance_graph(
     dist_table,
     distance_pvals,
@@ -4972,3 +4824,391 @@ def create_mask_dict_png(mask_file_paths, region_names):
         mask_dict[region_name] = combined_mask
 
     return mask_dict
+
+
+def ppa_res_donut(
+    adata,
+    cat_col,
+    key_name="ppa_result",
+    palette=None,
+    distance_mode="within",  # "within" or "between"
+    unit="µm",
+    figsize=(10, 10),
+    add_guides=True,
+    text="example CN",
+    label_color="black",
+    rand_seed=1,
+    subset_column=None,
+    subset_condition=None,
+    group_by=None,  # New parameter to group by a column
+    title="Title",
+    savefig=False,
+    output_fname="",
+    output_dir="./",
+):
+    """
+    Plot donut chart of cell type proportions at different distances.
+    Generates a multi-ring donut chart where each ring represents a specific
+    distance range from the patches. The segments within each
+    ring show the proportion of different categories (e.g., cell types)
+    found within that distance range. The function can operate in two modes:
+    'within' (cumulative proportions up to a distance) or 'between'
+    (proportions within discrete distance intervals). It also supports
+    subsetting the data and generating separate plots for different groups.
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        Annotated data object containing the results in `adata.uns`.
+        Column name in the results DataFrame (accessed via `key_name`)
+        that contains the categorical data to plot (e.g., 'cell_type').
+    key_name : str, optional
+        Key in `adata.uns` where the DataFrame containing distance
+        information (specifically 'distance_from_patch' column) is stored.
+        Defaults to "ppa_result".
+    palette : dict or None, optional
+        A dictionary mapping category names (from `cat_col`) to colors.
+        If None, colors are automatically generated using `tab20` colormap
+        and stored in `adata.uns[cat_col + '_colors']`. Defaults to None.
+    distance_mode : {'within', 'between'}, optional
+        Determines how proportions are calculated for each distance ring:
+        - "within": Includes all cells up to the specified distance. Rings
+          represent cumulative proportions.
+        - "between": Includes only cells between the current distance ring's
+          outer radius and the previous ring's outer radius. Rings represent
+          proportions in discrete intervals.
+        Defaults to "within".
+    unit : str, optional
+        Unit for distance labels displayed on the plot (e.g., 'µm', 'px').
+        Defaults to "µm".
+    figsize : tuple, optional
+        Size of the figure (width, height) in inches. Defaults to (10, 10).
+    add_guides : bool, optional
+        Whether to add radial and circular guide lines to the plot background.
+        Defaults to True.
+    text : str, optional
+        Text to display in the center of the donut chart. Defaults to
+        "example CN".
+    label_color : str, optional
+        Color of the distance labels placed on the rings. Defaults to "black".
+    rand_seed : int, optional
+        Random seed used for reproducible color generation if `palette` is None.
+        Defaults to 1.
+    subset_column : str or None, optional
+        Column name in the results DataFrame to use for subsetting the data
+        before plotting. If None, no subsetting is performed based on this.
+        Defaults to None.
+    subset_condition : str or None, optional
+        Value within `subset_column` to filter the data by. Only data points
+        where `subset_column` equals `subset_condition` will be used.
+        Requires `subset_column` to be set. Defaults to None.
+    group_by : str or None, optional
+        Column name in the results DataFrame to group the data by. If provided,
+        a separate donut chart will be generated for each unique value in this
+        column. The function calls itself recursively for each group.
+        Defaults to None.
+    title : str, optional
+        Main title for the plot. If `group_by` is used, the group identifier
+        will be appended to this title for each subplot. Defaults to "Title".
+    savefig : bool, optional
+        Whether to save the generated figure(s) to disk. If False, displays
+        the plot instead. Defaults to False.
+    output_fname : str, optional
+        Base filename for the saved plot (without extension). If `group_by`
+        is used, the group identifier will be appended. Defaults to "".
+    output_dir : str, optional
+        Directory where the plot(s) will be saved if `savefig` is True.
+        Defaults to "./".
+    Returns
+    -------
+    matplotlib.figure.Figure or dict
+        If `group_by` is None, returns the single matplotlib Figure object
+        for the plot.
+        If `group_by` is provided, returns a dictionary where keys are the
+        unique values from the `group_by` column and values are the
+        corresponding matplotlib Figure objects.
+    Raises
+    ------
+    ValueError
+        If `key_name` is not found in `adata.uns`.
+        If the DataFrame accessed by `key_name` is empty.
+        If the 'distance_from_patch' column is missing in the DataFrame.
+        If `cat_col` is missing in the DataFrame.
+        If `subset_column` is provided but missing in the DataFrame.
+        If `subset_condition` is provided but not found within `subset_column`.
+        If `group_by` column is missing in the DataFrame.
+        If no distance values are found in the 'distance_from_patch' column.
+        If `distance_mode` is not 'within' or 'between'.
+        If a category found in the data is missing from the provided `palette`.
+    Notes
+    -----
+    - The function assumes the results DataFrame stored in `adata.uns[key_name]`
+      contains at least the columns specified by `cat_col` and
+      'distance_from_patch'.
+    - When `group_by` is used, the function makes recursive calls to itself,
+      passing the subsetted data for each group. The `subset_column` and
+      `subset_condition` parameters within the recursive call are used to
+      filter for the specific group, and `group_by` is set to None to prevent
+      infinite recursion.
+    - The radii of the donut rings increase linearly with the sorted unique
+      distance values. The innermost ring corresponds to the smallest distance,
+      and the outermost ring corresponds to the largest distance.
+    """
+    import os
+    import textwrap
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Define helper function for color generation if using generate_random_colors
+    def hf_generate_random_colors(n, rand_seed=1):
+        """Generate random colors for n categories."""
+        np.random.seed(rand_seed)
+        return [plt.cm.tab20(i % 20) for i in range(n)]
+
+    # extract key from adata
+    region_results = adata.uns[key_name]
+
+    # check if region_results is empty
+    if region_results.shape[0] == 0:
+        print(f"Key {key_name} is empty.")
+        return
+
+    # check if distance_from_patch column exists
+    if "distance_from_patch" not in region_results.columns:
+        raise ValueError("distance_from_patch column not found in the dataframe")
+
+    # Check if cat_col exists in region_results
+    if cat_col not in region_results.columns:
+        raise ValueError(f"Column '{cat_col}' not found in region_results")
+
+    # generate reproducable colors if no palette is provided
+    if palette is None:
+        if cat_col + "_colors" not in adata.uns.keys():
+            ct_colors = hf_generate_random_colors(
+                len(adata.obs[cat_col].unique()), rand_seed=rand_seed
+            )
+            palette = dict(zip(np.sort(adata.obs[cat_col].unique()), ct_colors))
+            adata.uns[cat_col + "_colors"] = ct_colors
+        else:
+            palette = dict(
+                zip(
+                    np.sort(adata.obs[cat_col].unique()), adata.uns[cat_col + "_colors"]
+                )
+            )
+
+    # subset by condition if specified
+    if subset_column is not None:
+        if subset_column not in region_results.columns:
+            raise ValueError(
+                f"Column '{subset_column}' does not exist in the DataFrame."
+            )
+        elif subset_condition not in region_results[subset_column].unique():
+            raise ValueError(
+                f"Value '{subset_condition}' does not exist in the column '{subset_column}'."
+            )
+        else:
+            region_results = region_results[
+                region_results[subset_column] == subset_condition
+            ]
+
+    # If group_by is specified, create separate visualizations for each group
+    if group_by is not None:
+        if group_by not in region_results.columns:
+            raise ValueError(
+                f"Group by column '{group_by}' not found in region_results"
+            )
+
+        # Get unique values in the group_by column
+        group_values = region_results[group_by].unique()
+        figs = {}
+
+        # Create a figure for each group
+        for group_val in group_values:
+            print(f"Creating visualization for {group_by} = {group_val}")
+            # Filter data for this group
+            group_data = region_results[region_results[group_by] == group_val]
+
+            # Skip groups with no data
+            if len(group_data) == 0:
+                print(f"No data for {group_by} = {group_val}, skipping")
+                continue
+
+            # Custom title including the group value
+            group_title = f"{title} - {group_by}: {group_val}"
+
+            # Custom filename if saving
+            group_filename = (
+                f"{output_fname}_{group_by}_{group_val}"
+                if output_fname
+                else f"{group_by}_{group_val}"
+            )
+
+            # Call this function recursively without group_by to avoid infinite recursion
+            fig = ppa_res_donut(
+                adata=adata,
+                cat_col=cat_col,
+                key_name=key_name,
+                palette=palette,
+                distance_mode=distance_mode,
+                unit=unit,
+                figsize=figsize,
+                add_guides=add_guides,
+                text=text,
+                label_color=label_color,
+                rand_seed=rand_seed,
+                subset_column=group_by,  # Use group_by as the subset column
+                subset_condition=group_val,  # Use group_val as the subset condition
+                group_by=None,  # Don't group again to avoid recursion
+                title=group_title,
+                savefig=savefig,
+                output_fname=group_filename,
+                output_dir=output_dir,
+            )
+
+            figs[group_val] = fig
+
+        return figs
+
+    # Extract unique distances from the dataframe
+    available_distances = sorted(region_results["distance_from_patch"].unique())
+    if len(available_distances) == 0:
+        raise ValueError("No distance values found in distance_from_patch column")
+
+    # plotting
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if add_guides:
+        # add grid lines
+        plt.plot([0, 0], [1.05, -1.05], color="black", alpha=0.3, zorder=-1)
+        plt.plot([1.05, -1.05], [0, 0], color="black", alpha=0.3, zorder=-1)
+        # add diagonal lines
+        for angle in [45, -45]:
+            x_new = 1.05 * np.cos(np.radians(angle))
+            y_new = 1.05 * np.sin(np.radians(angle))
+            plt.plot(
+                [-x_new, x_new], [-y_new, y_new], color="black", alpha=0.3, zorder=-1
+            )
+
+    # Collect all categories to ensure consistent wedge ordering
+    all_categories = region_results[cat_col].unique()
+
+    # Process each distance - START FROM SMALLEST (INNERMOST) TO LARGEST (OUTERMOST)
+    for i, radius in enumerate(available_distances):  # Not reversed anymore
+        # Filter data based on distance_mode
+        if distance_mode == "within":
+            # Include all cells within the radius
+            filtered_results = region_results[
+                region_results["distance_from_patch"] <= radius
+            ]
+        elif distance_mode == "between":
+            # Include only cells between this radius and the next smaller one
+            if i == 0:  # Smallest radius (innermost ring)
+                prev_radius = 0
+            else:
+                prev_radius = available_distances[i - 1]  # Previous (smaller) radius
+
+            filtered_results = region_results[
+                (region_results["distance_from_patch"] <= radius)
+                & (region_results["distance_from_patch"] > prev_radius)
+            ]
+        else:
+            raise ValueError("distance_mode must be 'within' or 'between'")
+
+        print(f"Radius {radius}: {filtered_results.shape[0]} cells")
+
+        if filtered_results.shape[0] > 0:
+            # Calculate percentages for this specific radius
+            percentage_dict = (
+                filtered_results[cat_col].value_counts(normalize=True) * 100
+            )
+
+            # Create list of values and colors in consistent order
+            wedge_values = []
+            wedge_colors = []
+
+            # For each possible category, get its percentage (or 0 if not present)
+            for category in all_categories:
+                if category in percentage_dict.index:
+                    wedge_values.append(percentage_dict[category])
+                    if category not in palette:
+                        raise ValueError(
+                            f"No color provided for category {category} in the palette"
+                        )
+                    wedge_colors.append(palette[category])
+
+            # Only draw if there are values to plot
+            if wedge_values:
+                # Radius increases with distance - smallest at center, largest at outside
+                ring_radius = 0.5 + 0.1 * (i + 1)
+
+                # Draw this ring's pie
+                ax.pie(
+                    wedge_values,
+                    radius=ring_radius,
+                    colors=wedge_colors,
+                    startangle=90,  # Start at top
+                    wedgeprops=dict(width=0.1, edgecolor="w"),  # Make it a ring
+                )
+
+    # add labels for each distance ring
+    for j, radius in enumerate(available_distances):  # Not reversed anymore
+        plt.text(
+            0,
+            (0.45 + 0.1 * (j + 1)),  # Label position corresponds to ring radius
+            str(radius) + unit,
+            horizontalalignment="center",
+            fontweight="bold",
+            color=label_color,
+        )
+
+    # add a circle at the center to transform it in a donut chart
+    my_circle = plt.Circle((0, 0), 0.45, color="white")  # Smaller center circle
+    p = plt.gcf()
+    p.gca().add_artist(my_circle)
+
+    # add a legend based on the colors and keys in palette
+    # Only include categories that are present in the data
+    present_categories = region_results[cat_col].unique()
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=palette[key])
+        for key in present_categories
+        if key in palette
+    ]
+
+    plt.legend(
+        handles,
+        [cat for cat in present_categories if cat in palette],
+        bbox_to_anchor=(0.94, 0.925),
+        loc="upper left",
+        prop={"size": 15},
+    )
+
+    # Define the maximum length of a line
+    max_line_length = 20
+
+    # Split the text into multiple lines if it's too long
+    wrapped_text = textwrap.fill(text, max_line_length)
+
+    # Add a title in the middle of the white circle
+    plt.text(
+        0,
+        0,
+        wrapped_text,
+        horizontalalignment="center",
+        verticalalignment="center",
+        fontsize=18,
+    )
+
+    plt.title(title, size=24, y=0.96)
+    plt.axis("equal")  # Equal aspect ratio ensures circle looks round
+
+    if savefig is None:
+        pass
+    elif savefig:
+        plt.savefig(
+            os.path.join(output_dir, f"{output_fname}.pdf"), bbox_inches="tight"
+        )
+    else:
+        plt.show()
+
+    return fig

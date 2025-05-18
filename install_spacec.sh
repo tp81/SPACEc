@@ -1,4 +1,6 @@
 #!/bin/bash
+# TODO: Outdated?
+
 set -e
 
 # Function to prompt user for package manager choice

@@ -1,6 +1,16 @@
 # load required packages
 from __future__ import annotations
 
+# Filter out specific FutureWarnings from anndata and tm
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="anndata.utils")
+import logging
+
+logging.disable(
+    logging.CRITICAL
+)  # disables all logging messages at and below CRITICAL level
+
 import os
 import platform
 import subprocess
@@ -10,6 +20,7 @@ import zipfile
 
 import requests
 
+# TODO: Remove this!
 if platform.system() == "Windows":
     vipsbin = r"c:\vips-dev-8.15\bin\vips-dev-8.15\bin"
     vips_file_path = os.path.join(vipsbin, "vips.exe")
@@ -40,48 +51,43 @@ if platform.system() == "Windows":
 
 
 import argparse
+import json
 import pathlib
 import pickle
+import re
 import time
 from builtins import range
-from itertools import combinations
 from multiprocessing import Pool
 from typing import TYPE_CHECKING
 
-import anndata
-import concave_hull
+import geopandas as gpd
+import matplotlib.patheffects as PathEffects
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
 import panel as pn
 import scipy.stats as st
-import skimage
-import skimage.color
-import skimage.exposure
 import skimage.filters.rank
-import skimage.io as io
-import skimage.morphology
-import skimage.transform
-import statsmodels.api as sm
 import tissuumaps.jupyter as tj
 import torch
 from concave_hull import concave_hull_indexes
 from joblib import Parallel, delayed
+from matplotlib.patches import Patch
 from pyFlowSOM import map_data_to_nodes, som
 from scipy import stats
-from scipy.spatial import Delaunay, KDTree, distance
+from scipy.spatial import Delaunay
 from scipy.spatial.distance import cdist
-from scipy.stats import pearsonr, spearmanr
+from shapely.geometry import MultiPolygon
 from skimage.io import imsave
 from skimage.segmentation import find_boundaries
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import HDBSCAN, MiniBatchKMeans
 from sklearn.cross_decomposition import CCA
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, f1_score, pairwise_distances
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import NearestNeighbors
-from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+from sklearn.svm import SVC, LinearSVC
 from tqdm import tqdm
 from yellowbrick.cluster import KElbowVisualizer
 
@@ -90,11 +96,6 @@ if TYPE_CHECKING:
 
 from ..helperfunctions._general import *
 from ..plotting._general import catplot
-
-try:
-    from torch_geometric.data import ClusterData, ClusterLoader, Data, InMemoryDataset
-except ImportError:
-    pass
 
 try:
     import cupy as cp
@@ -258,7 +259,7 @@ def clustering(
     n_neighbors : int, optional
         The number of neighbors to use for the neighbors graph. Defaults to 10.
     reclustering : bool, optional
-        Whether to recluster the data. Defaults to False.
+        If set to True, the function will skip the calculation of neighbors and UMAP. This can be used to speed up the process when just reclustering or running flowSOM.
     key_added : str, optional
         The key name to add to the adata object. Defaults to None.
     key_filter : str, optional
@@ -783,162 +784,243 @@ def tl_format_for_squidpy(adata, x_col, y_col):
     return new_adata
 
 
-def calculate_triangulation_distances(df_input, id, x_pos, y_pos, cell_type, region):
+def compute_triangulation_edges(df_input, x_pos, y_pos):
     """
-    Calculate distances between cells using Delaunay triangulation.
+    Compute unique Delaunay triangulation edges from input coordinates.
+
+    This function computes the Delaunay triangulation for the set of points defined by the
+    x and y positions contained in a DataFrame. It then extracts all unique edges from the
+    triangulation, calculates their Euclidean distances, and returns these as a new DataFrame.
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
-    id : str
-        Column name for cell id.
+        DataFrame containing the coordinate data.
     x_pos : str
-        Column name for x position of cells.
+        The column name in df_input for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
-    cell_type : str
-        Column name for cell type annotations.
-    region : str
-        Column name for region.
+        The column name in df_input for the y-coordinate.
 
     Returns
     -------
     pandas.DataFrame
-        Annotated result dataframe with calculated distances and additional information.
+        A DataFrame with columns:
+            - ind1: Index of the first point in each edge.
+            - ind2: Index of the second point in each edge.
+            - x1: x-coordinate of the first point.
+            - y1: y-coordinate of the first point.
+            - x2: x-coordinate of the second point.
+            - y2: y-coordinate of the second point.
+            - distance: Euclidean distance between the two points.
     """
-    # Perform Delaunay triangulation
     points = df_input[[x_pos, y_pos]].values
     tri = Delaunay(points)
-    indices = tri.simplices
 
-    # Get interactions going both directions
-    edges = set()
-    for simplex in indices:
-        for i in range(3):
-            for j in range(i + 1, 3):
-                edges.add(tuple(sorted([simplex[i], simplex[j]])))
-    edges = np.array(list(edges))
+    # Generate edges from triangles and remove duplicates
+    edges = np.vstack(
+        [tri.simplices[:, [0, 1]], tri.simplices[:, [1, 2]], tri.simplices[:, [2, 0]]]
+    )
+    # Sort each edge so that [i, j] and [j, i] are considered the same
+    edges = np.sort(edges, axis=1)
+    # Remove duplicate edges
+    edges = np.unique(edges, axis=0)
 
-    # Create dataframe from edges
-    rdelaun_result = pd.DataFrame(edges, columns=["ind1", "ind2"])
-    rdelaun_result[["x1", "y1"]] = df_input.iloc[rdelaun_result["ind1"]][
-        [x_pos, y_pos]
-    ].values
-    rdelaun_result[["x2", "y2"]] = df_input.iloc[rdelaun_result["ind2"]][
-        [x_pos, y_pos]
-    ].values
+    # Vectorized distance computation
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
 
-    # Annotate results with cell type and region information
-    df_input["XYcellID"] = (
-        df_input[x_pos].astype(str) + "_" + df_input[y_pos].astype(str)
-    )
-    rdelaun_result["cell1ID"] = (
-        rdelaun_result["x1"].astype(str) + "_" + rdelaun_result["y1"].astype(str)
-    )
-    rdelaun_result["cell2ID"] = (
-        rdelaun_result["x2"].astype(str) + "_" + rdelaun_result["y2"].astype(str)
-    )
+    ind1, ind2 = edges[:, 0], edges[:, 1]
+    x1_arr, y1_arr = x_coords[ind1], y_coords[ind1]
+    x2_arr, y2_arr = x_coords[ind2], y_coords[ind2]
 
-    annotated_result = pd.merge(
-        rdelaun_result, df_input, left_on="cell1ID", right_on="XYcellID"
-    )
-    annotated_result = annotated_result.rename(
-        columns={cell_type: "celltype1", id: "celltype1_index"}
-    )
-    annotated_result = annotated_result.drop(columns=[x_pos, y_pos, region, "XYcellID"])
+    dist_arr = np.sqrt((x2_arr - x1_arr) ** 2 + (y2_arr - y1_arr) ** 2)
 
-    annotated_result = pd.merge(
-        annotated_result,
-        df_input,
-        left_on="cell2ID",
-        right_on="XYcellID",
-        suffixes=(".x", ".y"),
-    )
-    annotated_result = annotated_result.rename(
-        columns={cell_type: "celltype2", id: "celltype2_index"}
-    )
-    annotated_result = annotated_result.drop(columns=[x_pos, y_pos, "XYcellID"])
-
-    # Calculate distance
-    annotated_result["distance"] = np.sqrt(
-        (annotated_result["x2"] - annotated_result["x1"]) ** 2
-        + (annotated_result["y2"] - annotated_result["y1"]) ** 2
-    )
-
-    # Ensure symmetry by adding reversed pairs
-    reversed_pairs = annotated_result.copy()
-    reversed_pairs = reversed_pairs.rename(
-        columns={
-            "celltype1_index": "celltype2_index",
-            "celltype1": "celltype2",
-            "celltype1_X": "celltype2_X",
-            "celltype1_Y": "celltype2_Y",
-            "celltype2_index": "celltype1_index",
-            "celltype2": "celltype1",
-            "celltype2_X": "celltype1_X",
-            "celltype2_Y": "celltype1_Y",
+    edges_df = pd.DataFrame(
+        {
+            "ind1": ind1,
+            "ind2": ind2,
+            "x1": x1_arr,
+            "y1": y1_arr,
+            "x2": x2_arr,
+            "y2": y2_arr,
+            "distance": dist_arr,
         }
     )
-    annotated_result = pd.concat([annotated_result, reversed_pairs])
+    return edges_df
 
-    # Reorder columns
+
+def annotate_triangulation_vectorized(
+    edges_df, df_input, id_col, x_pos, y_pos, cell_type_col, region
+):
+    """
+    Annotate edges with cell metadata in a vectorized manner.
+
+    This function takes the computed edges from the triangulation and annotates them with
+    additional information retrieved from the input DataFrame. It creates both the forward
+    and reverse (symmetrical) edges with cell identifiers, cell types, positions, and region info.
+
+    Parameters
+    ----------
+    edges_df : pandas.DataFrame
+        DataFrame containing the triangulation edges and their distances.
+    df_input : pandas.DataFrame
+        DataFrame containing cell metadata.
+    id_col : str
+        The column name in df_input that serves as the cell identifier.
+    x_pos : str
+        The column name in df_input for the x-coordinate.
+    y_pos : str
+        The column name in df_input for the y-coordinate.
+    cell_type_col : str
+        The column name in df_input for cell type annotation.
+    region : str
+        The column name in df_input for region information.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame containing annotated edges with the following columns:
+            - region: The region identifier.
+            - celltype1_index, celltype1, celltype1_X, celltype1_Y:
+                Information for the first cell.
+            - celltype2_index, celltype2, celltype2_X, celltype2_Y:
+                Information for the second cell.
+            - distance: The Euclidean distance between the two cells.
+    """
+    if len(df_input[region].unique()) == 1:
+        region_val = df_input[region].iloc[0]
+    else:
+        # In case of multiple regions, use the first region as annotation.
+        region_val = df_input[region].iloc[0]
+
+    # Convert needed columns to arrays for fast indexing
+    id_array = df_input[id_col].values
+    ct_array = df_input[cell_type_col].values
+    x_array = df_input[x_pos].values
+    y_array = df_input[y_pos].values
+
+    # Build references from edges DataFrame
+    ind1 = edges_df["ind1"].values
+    ind2 = edges_df["ind2"].values
+    x1_arr = edges_df["x1"].values
+    y1_arr = edges_df["y1"].values
+    x2_arr = edges_df["x2"].values
+    y2_arr = edges_df["y2"].values
+    dist_arr = edges_df["distance"].values
+
+    # Create direct "forward" annotated DataFrame
+    data_forward = pd.DataFrame(
+        {
+            region: [region_val] * len(ind1),
+            "celltype1_index": id_array[ind1],
+            "celltype1": ct_array[ind1],
+            "celltype1_X": x1_arr,
+            "celltype1_Y": y1_arr,
+            "celltype2_index": id_array[ind2],
+            "celltype2": ct_array[ind2],
+            "celltype2_X": x2_arr,
+            "celltype2_Y": y2_arr,
+            "distance": dist_arr,
+        }
+    )
+
+    # Create symmetrical (reverse) annotated DataFrame
+    data_reverse = pd.DataFrame(
+        {
+            region: [region_val] * len(ind1),
+            "celltype1_index": id_array[ind2],
+            "celltype1": ct_array[ind2],
+            "celltype1_X": x2_arr,
+            "celltype1_Y": y2_arr,
+            "celltype2_index": id_array[ind1],
+            "celltype2": ct_array[ind1],
+            "celltype2_X": x1_arr,
+            "celltype2_Y": y1_arr,
+            "distance": dist_arr,
+        }
+    )
+
+    # Concatenate forward and reverse dataframes
+    annotated_result = pd.concat([data_forward, data_reverse], ignore_index=True)
     annotated_result = annotated_result[
         [
             region,
             "celltype1_index",
             "celltype1",
-            "x1",
-            "y1",
+            "celltype1_X",
+            "celltype1_Y",
             "celltype2_index",
             "celltype2",
-            "x2",
-            "y2",
+            "celltype2_X",
+            "celltype2_Y",
             "distance",
         ]
     ]
-    annotated_result.columns = [
-        region,
-        "celltype1_index",
-        "celltype1",
-        "celltype1_X",
-        "celltype1_Y",
-        "celltype2_index",
-        "celltype2",
-        "celltype2_X",
-        "celltype2_Y",
-        "distance",
-    ]
-
     return annotated_result
 
 
-# Define the process_region function at the top level
-def process_region(df, unique_region, id, x_pos, y_pos, cell_type, region):
+def calculate_triangulation_distances(df_input, id, x_pos, y_pos, cell_type, region):
     """
-    Process a specific region of a dataframe, calculating triangulation distances.
+    Calculate and annotate triangulation distances for cells.
+
+    This function computes the triangulation edges for input cell data and then annotates
+    them with cell metadata. It serves as a wrapper combining both steps into one process.
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        Input dataframe containing cell information.
-    unique_region : str
-        Unique region identifier.
+    df_input : pandas.DataFrame
+        DataFrame containing the cell data.
     id : str
-        Column name for cell id.
+        Column name for cell identifiers.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with calculated distances and additional information for the specified region.
+        Annotated DataFrame with triangulation edges and metadata.
+    """
+    edges_df = compute_triangulation_edges(df_input, x_pos, y_pos)
+    annotated_result = annotate_triangulation_vectorized(
+        edges_df, df_input, id, x_pos, y_pos, cell_type, region
+    )
+    return annotated_result
+
+
+def process_region(df, unique_region, id, x_pos, y_pos, cell_type, region):
+    """
+    Process triangulation distances for a specific region.
+
+    This function subsets the dataframe to one specific region, adds unique identifier
+    columns, and calculates the triangulation distances for that region.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The full dataset containing cell information.
+    unique_region : str
+        The specific region to process.
+    id : str
+        Column name for cell identifiers.
+    x_pos : str
+        Column name for x-coordinate.
+    y_pos : str
+        Column name for y-coordinate.
+    cell_type : str
+        Column name for cell type information.
+    region : str
+        Column name for region information.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Annotated DataFrame with triangulation distances for the specified region.
     """
     subset = df[df[region] == unique_region].copy()
     subset["uniqueID"] = (
@@ -964,38 +1046,40 @@ def get_triangulation_distances(
     df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, correct_dtype=True
 ):
     """
-    Calculate triangulation distances for each unique region in the input dataframe.
+    Compute triangulation distances for each unique region with parallel processing.
+
+    This function processes the input DataFrame by first ensuring datatype consistency
+    (optionally converting coordinate values to integers), and then computes triangulation
+    distances per region in parallel using half of the available CPU cores (by default).
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
+        DataFrame containing cell data including coordinates, cell types, and region info.
     id : str
-        Column name for cell id.
+        Column name for cell identifiers.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     num_cores : int, optional
-        Number of cores to use for parallel processing. If None, defaults to half of available cores.
+        Number of CPU cores to use for parallel processing. If None, defaults to half of os.cpu_count().
     correct_dtype : bool, optional
-        If True, corrects the data type of the cell_type and region columns to string.
+        Flag to convert columns to proper data types. Defaults to True.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with calculated distances and additional information for each unique region.
+        A concatenated DataFrame with triangulation distances computed for all regions.
     """
-    if correct_dtype == True:
-        # change columns to pandas string
+    if correct_dtype:
         df_input[cell_type] = df_input[cell_type].astype(str)
         df_input[region] = df_input[region].astype(str)
 
-    # Check if x_pos and y_pos are integers, and if not, convert them
     if not issubclass(df_input[x_pos].dtype.type, np.integer):
         print("This function expects integer values for xy coordinates.")
         print(
@@ -1007,54 +1091,48 @@ def get_triangulation_distances(
         df_input[x_pos] = df_input[x_pos].astype(int).values
         df_input[y_pos] = df_input[y_pos].astype(int).values
 
-    # Get unique regions
     unique_regions = df_input[region].unique()
-
-    # Select only necessary columns
     df_input = df_input.loc[:, [id, x_pos, y_pos, cell_type, region]]
 
-    # Set up parallelization
     if num_cores is None:
-        num_cores = os.cpu_count() // 2  # default to using half of available cores
+        num_cores = os.cpu_count() // 2
 
-    # Parallel processing using joblib
+    # Parallelize region processing
     results = Parallel(n_jobs=num_cores)(
         delayed(process_region)(df_input, reg, id, x_pos, y_pos, cell_type, region)
         for reg in unique_regions
     )
 
     triangulation_distances = pd.concat(results)
-
     return triangulation_distances
 
 
 def shuffle_annotations(df_input, cell_type, region, permutation):
     """
-    Shuffle annotations within each unique region in the input dataframe.
+    Shuffle cell type annotations within each region.
+
+    This function randomizes the cell type annotations of the input DataFrame on a per-region basis
+    using a pseudo-random permutation seed.
 
     Parameters
     ----------
     df_input : pandas.DataFrame
-        Input dataframe containing cell information.
+        DataFrame containing cell data.
     cell_type : str
-        Column name for cell type annotations.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     permutation : int
-        Seed for the random number generator.
+        An integer used to seed the random number generator for reproducible shuffling.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with shuffled annotations for each unique region.
+        A copy of df_input with an added column "random_annotations" representing the shuffled cell types.
     """
-    # Set the seed for reproducibility
     np.random.seed(permutation + 1234)
-
-    # Create a copy to avoid modifying the original dataframe
     df_shuffled = df_input.copy()
 
-    # Shuffle annotations within each region
     for region_name in df_shuffled[region].unique():
         region_mask = df_shuffled[region] == region_name
         shuffled_values = df_shuffled.loc[region_mask, cell_type].sample(frac=1).values
@@ -1063,305 +1141,200 @@ def shuffle_annotations(df_input, cell_type, region, permutation):
     return df_shuffled
 
 
-def tl_iterate_tri_distances(
-    df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, num_iterations=1000
+def _process_region_iterations(
+    subset,
+    edges_df,
+    id_col,
+    x_col,
+    y_col,
+    cell_type_col,
+    region_col,
+    region_val,
+    num_iterations,
 ):
     """
-    Iterate over triangulation distances for each unique region in the input dataframe.
+    Process multiple iterations of permutation for a given region.
+
+    This helper function takes a subset of the data and precomputed triangulation edges
+    and performs a series of iterations where cell type annotations are shuffled and the
+    mean distances are computed for each permutation.
 
     Parameters
     ----------
-    df_input : pandas.DataFrame
-        Input dataframe containing cell information.
-    id : str
-        Column name for cell id.
-    x_pos : str
-        Column name for x position of cells.
-    y_pos : str
-        Column name for y position of cells.
-    cell_type : str
-        Column name for cell type.
-    region : str
-        Column name for region.
-    num_cores : int, optional
-        Number of cores to use for parallel processing. If None, defaults to half of available cores.
-    num_iterations : int, optional
-        Number of iterations to perform. Defaults to 1000.
+    subset : pandas.DataFrame
+        DataFrame containing a subset of cell data for a single region.
+    edges_df : pandas.DataFrame
+        Precomputed triangulation edges for the subset.
+    id_col : str
+        Column name for cell identifiers.
+    x_col : str
+        Column name for the x-coordinate.
+    y_col : str
+        Column name for the y-coordinate.
+    cell_type_col : str
+        Column name for cell type or annotation to be shuffled.
+    region_col : str
+        Column name for region information.
+    region_val : str
+        The specific region value being processed.
+    num_iterations : int
+        Number of permutation iterations to perform.
 
     Returns
     -------
     pandas.DataFrame
-        Result dataframe with iterative triangulation distances for each unique region.
+        A DataFrame concatenating the mean distance summaries for each iteration.
+    """
+    results_list = []
+    for iteration in range(1, num_iterations + 1):
+        shuffled = shuffle_annotations(subset, cell_type_col, region_col, iteration)
+        annotated_df = annotate_triangulation_vectorized(
+            edges_df, shuffled, id_col, x_col, y_col, "random_annotations", region_col
+        )
+        per_cell_summary = (
+            annotated_df.groupby(["celltype1_index", "celltype1", "celltype2"])
+            .distance.mean()
+            .reset_index(name="per_cell_mean_dist")
+        )
+        per_celltype_summary = (
+            per_cell_summary.groupby(["celltype1", "celltype2"])
+            .per_cell_mean_dist.mean()
+            .reset_index(name="mean_dist")
+        )
+        per_celltype_summary[region_col] = region_val
+        per_celltype_summary["iteration"] = iteration
+        results_list.append(per_celltype_summary)
+    return pd.concat(results_list, ignore_index=True)
+
+
+def tl_iterate_tri_distances(
+    df_input, id, x_pos, y_pos, cell_type, region, num_cores=None, num_iterations=1000
+):
+    """
+    Perform iterative permutation analysis for triangulation distances.
+
+    This function iterates over each unique region to calculate permutation-based triangulation
+    distance summaries using precomputed edges. It applies parallel processing to perform
+    multiple iterations efficiently.
+
+    Parameters
+    ----------
+    df_input : pandas.DataFrame
+        DataFrame containing the cell information.
+    id : str
+        Column name for cell identifiers.
+    x_pos : str
+        Column name for the x-coordinate.
+    y_pos : str
+        Column name for the y-coordinate.
+    cell_type : str
+        Column name for cell type information.
+    region : str
+        Column name for region information.
+    num_cores : int, optional
+        Number of CPU cores to use for parallelization. Defaults to half of os.cpu_count() if None.
+    num_iterations : int, optional
+        Number of permutation iterations to perform. Defaults to 1000.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A concatenated DataFrame with permutation-based mean distances for each region.
     """
     unique_regions = df_input[region].unique()
-    # Use only the necessary columns
     df_input = df_input[[id, x_pos, y_pos, cell_type, region]]
 
-    if num_cores is None:
-        num_cores = os.cpu_count() // 2  # Default to using half of available cores
-
-    # Define a helper function to process each region and iteration
-    def process_iteration(region_name, iteration):
-        # Filter by region
-        subset = df_input[df_input[region] == region_name].copy()
-        # Create unique IDs
-        subset.loc[:, "uniqueID"] = (
+    # Precompute triangulation edges for each region
+    region2df = {}
+    region2edges_df = {}
+    for reg_name in unique_regions:
+        subset = df_input[df_input[region] == reg_name].copy()
+        subset["uniqueID"] = (
             subset[id].astype(str)
             + "-"
             + subset[x_pos].astype(str)
             + "-"
             + subset[y_pos].astype(str)
         )
-        subset.loc[:, "XYcellID"] = (
-            subset[x_pos].astype(str) + "_" + subset[y_pos].astype(str)
+        subset["XYcellID"] = subset[x_pos].astype(str) + "_" + subset[y_pos].astype(str)
+        edges_df = compute_triangulation_edges(subset, x_pos, y_pos)
+        region2df[reg_name] = subset
+        region2edges_df[reg_name] = edges_df
+
+    def process_one_region(r):
+        subset = region2df[r]
+        edges_df = region2edges_df[r]
+        return _process_region_iterations(
+            subset, edges_df, id, x_pos, y_pos, cell_type, region, r, num_iterations
         )
 
-        # Shuffle annotations
-        shuffled = shuffle_annotations(subset, cell_type, region, iteration)
-
-        # Get triangulation distances
-        results = get_triangulation_distances(
-            df_input=shuffled,
-            id=id,
-            x_pos=x_pos,
-            y_pos=y_pos,
-            cell_type="random_annotations",
-            region=region,
-            num_cores=num_cores,
-            correct_dtype=False,
-        )
-
-        # Summarize results
-        per_cell_summary = (
-            results.groupby(["celltype1_index", "celltype1", "celltype2"])
-            .distance.mean()
-            .reset_index(name="per_cell_mean_dist")
-        )
-
-        per_celltype_summary = (
-            per_cell_summary.groupby(["celltype1", "celltype2"])
-            .per_cell_mean_dist.mean()
-            .reset_index(name="mean_dist")
-        )
-        per_celltype_summary[region] = region_name
-        per_celltype_summary["iteration"] = iteration
-
-        return per_celltype_summary
-
-    # TODO: remove nans valid here a good idea (attempt to fix windows unpickle issue)?
-    unique_regions = [r for r in unique_regions if r != np.nan]
-
-    # Parallel processing for each region and iteration
-    results = Parallel(n_jobs=num_cores)(
-        delayed(process_iteration)(region_name, iteration)
-        for region_name in unique_regions
-        for iteration in range(1, num_iterations + 1)
-    )
-
-    # Combine all results
-    iterative_triangulation_distances = pd.concat(results, ignore_index=True)
-    # iterative_triangulation_distances = iterative_triangulation_distances.dropna()
+    results_per_region = Parallel(
+        n_jobs=num_cores if num_cores is not None else os.cpu_count() // 2
+    )(delayed(process_one_region)(r) for r in unique_regions)
+    iterative_triangulation_distances = pd.concat(results_per_region, ignore_index=True)
     return iterative_triangulation_distances
-
-
-# def tl_iterate_tri_distances_ad(
-#    adata,
-#    id,
-#    x_pos,
-#    y_pos,
-#    cell_type,
-#    region,
-#    num_cores=None,
-#    num_iterations=1000,
-#    key_name=None,
-#    correct_dtype=True,
-# ):
-#    """
-#    Iterate over triangulation distances for each unique region in the input AnnData object
-
-#    Parameters
-#    ----------
-#    adata : anndata.AnnData
-#        Annotated data matrix.
-#    id : str
-#        Column name for cell id.
-#    x_pos : str
-#        Column name for x position of cells.
-#    y_pos : str
-#        Column name for y position of cells.
-#    cell_type : str
-#        Column name for cell type.
-#    region : str
-#        Column name for region.
-#    num_cores : int, optional
-#        Number of cores to use for parallel processing. If None, defaults to half of available cores.
-#    num_iterations : int, optional
-#        Number of iterations to perform. Defaults to 1000.
-#    key_name : str, optional
-#        Key name to use when saving the result to the AnnData object. If None, defaults to "iTriDist_" + str(num_iterations).
-#    correct_dtype : bool, optional
-#        If True, corrects the data type of the cell type and region columns to string. Defaults to True.
-
-#    Returns
-#    -------
-#    pandas.DataFrame
-#        Result dataframe with iterative triangulation distances for each unique region.
-#    """
-#    df_input = pd.DataFrame(adata.obs)
-#    df_input[id] = df_input.index
-
-#    if correct_dtype == True:
-#        # change columns to pandas string
-#        df_input[cell_type] = df_input[cell_type].astype(str)
-#        df_input[region] = df_input[region].astype(str)
-
-#    # Check if x_pos and y_pos are integers, and if not, convert them
-#    if not issubclass(df_input[x_pos].dtype.type, np.integer):
-#        print("This function expects integer values for xy coordinates.")
-#        print("Class will be changed to integer. Please check the generated output!")
-#        df_input[x_pos] = df_input[x_pos].astype(int).values
-#        df_input[y_pos] = df_input[y_pos].astype(int).values
-
-#    unique_regions = df_input[region].unique()
-#    # Use only the necessary columns
-#    df_input = df_input.loc[:, [id, x_pos, y_pos, cell_type, region]]
-
-#    if num_cores is None:
-#        num_cores = os.cpu_count() // 2  # Default to using half of available cores
-
-# Define a helper function to process each region and iteration
-#    def process_iteration(region_name, iteration):
-#        # Filter by region
-#        subset = df_input.loc[df_input[region] == region_name, :].copy()
-#        subset.loc[:, "uniqueID"] = (
-#            subset[id].astype(str)
-#            + "-"
-#            + subset[x_pos].astype(str)
-#            + "-"
-#            + subset[y_pos].astype(str)
-#        )
-#        subset.loc[:, "XYcellID"] = (
-#            subset[x_pos].astype(str) + "_" + subset[y_pos].astype(str)
-#        )
-
-# Shuffle annotations
-#        shuffled = shuffle_annotations(subset, cell_type, region, iteration)
-
-# Get triangulation distances
-#        results = get_triangulation_distances(
-#            df_input=shuffled,
-#            id=id,
-#            x_pos=x_pos,
-#            y_pos=y_pos,
-#            cell_type="random_annotations",
-#            region=region,
-#            num_cores=num_cores,
-#            correct_dtype=False,
-#        )
-
-#       # Summarize results
-#        per_cell_summary = (
-#            results.groupby(["celltype1_index", "celltype1", "celltype2"])
-#            .distance.mean()
-#            .reset_index(name="per_cell_mean_dist")
-#        )
-
-#        # Ensure symmetry by aggregating distances in both directions
-#        per_cell_summary_reversed = per_cell_summary.rename(
-#            columns={"celltype1": "celltype2", "celltype2": "celltype1"}
-#        )
-#        per_cell_summary_combined = pd.concat([per_cell_summary, per_cell_summary_reversed])#
-
-#        per_celltype_summary = (
-#            per_cell_summary_combined.groupby(["celltype1", "celltype2"])
-#            .per_cell_mean_dist.mean()
-#            .reset_index(name="mean_dist")
-#        )
-#        per_celltype_summary[region] = region_name
-#        per_celltype_summary["iteration"] = iteration#
-
-#       return per_celltype_summary
-
-# Parallel processing for each region and iteration
-#    results = Parallel(n_jobs=num_cores)(
-#        delayed(process_iteration)(region_name, iteration)
-#        for region_name in unique_regions
-#        for iteration in range(1, num_iterations + 1)
-#    )
-
-# Combine all results
-#    iterative_triangulation_distances = pd.concat(results, ignore_index=True)
-
-# append result to adata
-#    if key_name is None:
-#        key_name = "iTriDist_" + str(num_iterations)
-#    adata.uns[key_name] = iterative_triangulation_distances
-#    print("Save iterative triangulation distance output to anndata.uns " + key_name)
-
-#    return iterative_triangulation_distances
 
 
 def add_missing_columns(
     triangulation_distances, metadata, shared_column="unique_region"
 ):
     """
-    Add missing columns from metadata to triangulation_distances dataframe.
+    Add missing metadata columns to the triangulation distances DataFrame.
+
+    This function compares the metadata DataFrame with the triangulation distances DataFrame
+    and adds any columns from the metadata that are not present. It uses the shared_column
+    to map values and fills any missing values with "Unknown".
 
     Parameters
     ----------
     triangulation_distances : pandas.DataFrame
-        DataFrame containing triangulation distances.
+        DataFrame containing triangulation distances and possibly missing metadata columns.
     metadata : pandas.DataFrame
-        DataFrame containing metadata.
+        DataFrame containing additional metadata including the shared column.
     shared_column : str, optional
-        Column name that is shared between the two dataframes. Defaults to "unique_region".
+        Column name that is common to both DataFrames, by default "unique_region".
 
     Returns
     -------
     pandas.DataFrame
-        Updated triangulation_distances dataframe with missing columns added.
+        The updated triangulation distances DataFrame with added metadata columns.
     """
-    # Find the difference in columns
     missing_columns = set(metadata.columns) - set(triangulation_distances.columns)
-    # Add missing columns to triangulation_distances with NaN values
     for column in missing_columns:
         triangulation_distances[column] = pd.NA
-        # Create a mapping from unique_region to tissue in metadata
         region_to_tissue = pd.Series(
             metadata[column].values, index=metadata["unique_region"]
         ).to_dict()
-
-        # Apply this mapping to the triangulation_distances dataframe to create/update the tissue column
         triangulation_distances[column] = triangulation_distances["unique_region"].map(
             region_to_tissue
         )
-
-        # Handle regions with no corresponding tissue in the metadata by filling in a default value
         triangulation_distances[column].fillna("Unknown", inplace=True)
     return triangulation_distances
 
 
-# Calculate p-values and log fold differences
 def calculate_pvalue(row):
     """
     Calculate the p-value using the Mann-Whitney U test.
 
+    For a given row containing expected and observed lists of distances, this function
+    computes the p-value from the Mann-Whitney U test comparing the two distributions.
+    If the test fails, a NaN is returned.
+
     Parameters
     ----------
     row : pandas.Series
-        A row of data containing 'expected' and 'observed' values.
+        A row containing "expected" and "observed" distance lists.
 
     Returns
     -------
     float
-        The calculated p-value. Returns np.nan if there is insufficient data to perform the test.
+        The p-value computed from the Mann-Whitney U test, or NaN if computation fails.
     """
-    # function body here
     try:
         return st.mannwhitneyu(
             row["expected"], row["observed"], alternative="two-sided"
         ).pvalue
-    except ValueError:  # This handles cases with insufficient data
+    except ValueError:
         return np.nan
 
 
@@ -1382,45 +1355,51 @@ def identify_interactions(
     aggregate_per_cell=True,
 ):
     """
-    Identify interactions between cell types based on their spatial distances.
+    Identify significant cell-cell interactions based on spatial distances.
+
+    This function processes the input annotated data (adata) to compute observed triangulation
+    distances and perform permutation testing to generate expected distances. It then compares
+    the observed with expected mean distances using the Mann-Whitney U test to compute a p-value
+    and a log-fold change for each pair of cell types. The results are stored back in the adata
+    object and returned.
 
     Parameters
     ----------
     adata : AnnData
-        Annotated data matrix.
-    id : str
-        Identifier for cells.
+        Annotated data object that holds cell observation data (adata.obs).
+    cellid : str
+        Column name to be used as the unique cell identifier.
     x_pos : str
-        Column name for x position of cells.
+        Column name for the x-coordinate.
     y_pos : str
-        Column name for y position of cells.
+        Column name for the y-coordinate.
     cell_type : str
-        Column name for cell type.
+        Column name for cell type information.
     region : str
-        Column name for region.
+        Column name for region information.
     comparison : str
-        Column name for comparison.
-    iTriDist_keyname : str, optional
-        Key name for iterative triangulation distances, by default None
-    triDist_keyname : str, optional
-        Key name for triangulation distances, by default None
+        Column name used to compare different conditions.
     min_observed : int, optional
-        Minimum number of observed distances, by default 10
+        Minimum number of observed distance measurements required to consider a significant interaction (default: 10).
     distance_threshold : int, optional
-        Threshold for distance, by default 128
+        Maximum distance to consider when grouping cell interactions (default: 128).
     num_cores : int, optional
-        Number of cores to use for computation, by default None
+        Number of CPU cores to use for parallel processing. Defaults to half of available cores if None.
     num_iterations : int, optional
-        Number of iterations for computation, by default 1000
+        The number of permutation iterations for generating expected distances (default: 1000).
     key_name : str, optional
-        Key name for output, by default None
+        Key under which the triangulation distances will be stored in adata.uns. If None, defaults to "triDist".
     correct_dtype : bool, optional
-        Whether to correct data type or not, by default False
+        Flag to convert coordinate and region columns to string types (default: False).
+    aggregate_per_cell : bool, optional
+        Whether to aggregate distances initially at a per-cell basis (default: True).
 
     Returns
     -------
-    DataFrame
-        DataFrame with p-values and logfold changes for interactions.
+    tuple
+        A tuple containing:
+            - distance_pvals (pandas.DataFrame): DataFrame with p-values and log-fold changes for each pair of cell types.
+            - triangulation_distances_dict (dict): Dictionary containing observed and iterated triangulation distance DataFrames.
     """
     df_input = pd.DataFrame(adata.obs)
     if cellid in df_input.columns:
@@ -1429,7 +1408,6 @@ def identify_interactions(
         print(cellid + " is not in the adata.obs, use index as cellid instead!")
         df_input[cellid] = df_input.index
 
-    # change columns to pandas string
     df_input[cell_type] = df_input[cell_type].astype(str)
     df_input[region] = df_input[region].astype(str)
 
@@ -1446,6 +1424,8 @@ def identify_interactions(
     )
     if key_name is None:
         triDist_keyname = "triDist"
+    else:
+        triDist_keyname = key_name
     adata.uns[triDist_keyname] = triangulation_distances
     print("Save triangulation distances output to anndata.uns " + triDist_keyname)
 
@@ -1467,7 +1447,7 @@ def identify_interactions(
     triangulation_distances_long = add_missing_columns(
         triangulation_distances, metadata, shared_column=region
     )
-    if aggregate_per_cell == True:
+    if aggregate_per_cell:
         observed_distances = (
             triangulation_distances_long.query("distance <= @distance_threshold")
             .groupby(["celltype1_index", "celltype1", "celltype2", comparison, region])
@@ -1515,7 +1495,6 @@ def identify_interactions(
         .reset_index()
     )
 
-    # Drop comparisons with low numbers of observations
     observed_distances["keep"] = observed_distances["observed"].apply(
         lambda x: len(x) > min_observed
     )
@@ -1525,11 +1504,6 @@ def identify_interactions(
         lambda x: len(x) > min_observed
     )
     expected_distances = expected_distances[expected_distances["keep"]]
-
-    # concatenate observed and expected distances
-    distance_pvals = expected_distances.merge(
-        observed_distances, on=["celltype1", "celltype2", comparison], how="left"
-    )
 
     distance_pvals = expected_distances.merge(
         observed_distances, on=["celltype1", "celltype2", comparison], how="left"
@@ -1542,12 +1516,7 @@ def identify_interactions(
         distance_pvals["celltype1"] + " --> " + distance_pvals["celltype2"]
     )
 
-    # drop na from distance_pvals
-    # distance_pvals = distance_pvals.dropna()
-
-    # append result to adata
-
-    # create dictionary for the results
+    # Collect final results
     triangulation_distances_dict = {
         "distance_pvals": distance_pvals,
         "triangulation_distances_observed": iterated_triangulation_distances_long,
@@ -2137,7 +2106,10 @@ def patch_proximity_analysis(
 
 
 def stellar_get_edge_index(
-    pos, distance_thres, max_memory_usage=1.6e10, chunk_size=1000
+    pos,
+    distance_thres,
+    max_memory_usage=1.6e10,
+    chunk_size=5000,
 ):
     """
     Constructs edge indexes in one region based on pairwise distances and a distance threshold.
@@ -2152,9 +2124,7 @@ def stellar_get_edge_index(
     edge_list (list): A list of lists where each inner list contains two indices representing an edge.
     """
     n_samples = pos.shape[0]
-    estimated_memory_usage = (
-        n_samples * n_samples * 8
-    )  # Estimate memory usage for the distance matrix (float64)
+    estimated_memory_usage = n_samples * n_samples * 8  # ~float64 for distance matrix
 
     if estimated_memory_usage > max_memory_usage:
         print("Processing will be done in chunks to save memory.")
@@ -2179,34 +2149,98 @@ def stellar_get_edge_index(
 def adata_stellar(
     adata_train,
     adata_unannotated,
-    celltype_col="coarse_anno3",
+    celltype_col="cell_type",
+    region_column=None,
     x_col="x",
     y_col="y",
     sample_rate=0.5,
     distance_thres=50,
     epochs=50,
+    num_seed_class=3,
     key_added="stellar_pred",
     STELLAR_path="",
+    max_memory_usage=1.6e10,
+    chunk_size=5000,
+    wd=5e-2,
+    lr=1e-3,
+    seed=1,
+    batch_size=1,
 ):
     """
-    Applies the STELLAR algorithm to the given annotated and unannotated data.
+    Apply the STELLAR algorithm to annotated and unannotated spatial single-cell data.
 
-    Parameters:
-    adata_train (AnnData): The annotated data.
-    adata_unannotated (AnnData): The unannotated data.
-    celltype_col (str, optional): The column name for cell types in the annotated data. Defaults to 'coarse_anno3'.
-    x_col (str, optional): The column name for x coordinates in the data. Defaults to 'x'.
-    y_col (str, optional): The column name for y coordinates in the data. Defaults to 'y'.
-    sample_rate (float, optional): The rate at which to sample the training data. Defaults to 0.5.
-    distance_thres (int, optional): The distance threshold for constructing edge indexes. Defaults to 50.
-    key_added (str, optional): The key to be added to the unannotated data's obs dataframe for the predicted results. Defaults to 'stellar_pred'.
+    This function processes the input AnnData objects by preparing the training data,
+    constructing graph edges based on spatial coordinates, and then running the STELLAR
+    algorithm for label prediction. When a region column is provided, the edge computations
+    are performed for each region separately and the resulting edges are concatenated.
 
-    Returns:
-    adata (AnnData): The unannotated data with the added key for the predicted results.
+    Parameters
+    ----------
+    adata_train : AnnData
+        The annotated single-cell data used for training.
+    adata_unannotated : AnnData
+        The unannotated single-cell data for which predictions are desired.
+    celltype_col : str, optional
+        Column name in adata_train.obs that contains the cell type labels, by default "cell_type".
+    region_column : str or None, optional
+        Column name to partition data into regions. If not None, edges are computed independently
+        per region, by default None.
+    x_col : str, optional
+        Column name in the AnnData objects denoting the x-coordinate, by default "x".
+    y_col : str, optional
+        Column name in the AnnData objects denoting the y-coordinate, by default "y".
+    sample_rate : float, optional
+        The rate at which to sample the training data (between 0 and 1), by default 0.5.
+    distance_thres : int, optional
+        Distance threshold (in the same unit as the spatial coordinates) used to determine whether
+        a pair of cells is connected, by default 50.
+    epochs : int, optional
+        Number of training epochs for the STELLAR model, by default 50.
+    num_seed_class : int, optional
+        Number of seed classes, which are appended to the number of unique cell types, by default 3.
+    key_added : str, optional
+        Key under which the predicted labels will be stored in adata_unannotated.obs, by default "stellar_pred".
+    STELLAR_path : str, optional
+        Filesystem path to the STELLAR repository. This path is added to sys.path, by default "".
+    max_memory_usage : float, optional
+        Maximum allowable memory usage in bytes when computing pairwise distances; if exceeded,
+        the computation will be done in chunks, by default 1.6e10.
+    chunk_size : int, optional
+        The size of chunks to use for edge computation when memory usage is high, by default 5000.
+    wd : float, optional
+        Weight decay parameter for model optimization, by default 5e-2.
+    lr : float, optional
+        Learning rate for model training, by default 1e-3.
+    seed : int, optional
+        Seed used for reproducibility, by default 1.
+    batch_size : int, optional
+        Batch size for model training, by default 1.
+
+    Returns
+    -------
+    AnnData
+        The unannotated AnnData object with an additional observation column (key_added) containing
+        the predicted cell type labels.
+
+    Notes
+    -----
+    The function performs the following steps:
+      1. Prints a citation reminder for the STELLAR algorithm.
+      2. Sets up the model arguments by parsing command-line-like arguments.
+      3. Prepares the training data by concatenating coordinate information and cell types, and
+         builds a mapping between original and sampled indices.
+      4. Computes graph edges either globally or per region (if region_column is provided) using the
+         provided spatial coordinates and distance threshold.
+      5. Constructs a GraphDataset and runs the STELLAR algorithm on it.
+      6. Returns the modified adata_unannotated with predictions stored in obs[key_added].
+
+    The function assumes that helper functions (e.g., stellar_get_edge_index) and necessary modules,
+    including torch, argparse, and dataset utility modules, are available in the environment.
     """
-
     print(
-        "Please consider to cite the following paper when using STELLAR: Brbić, M., Cao, K., Hickey, J.W. et al. Annotation of spatially resolved single-cell data with STELLAR. Nat Methods 19, 1411–1418 (2022). https://doi.org/10.1038/s41592-022-01651-8"
+        "Please consider to cite the following paper when using STELLAR: "
+        "Brbić, M., Cao, K., Hickey, J.W. et al. Annotation of spatially resolved single-cell data with STELLAR. "
+        "Nat Methods 19, 1411–1418 (2022). https://doi.org/10.1038/s41592-022-01651-8"
     )
 
     sys.path.append(str(STELLAR_path))
@@ -2215,86 +2249,306 @@ def adata_stellar(
     from utils import prepare_save_dir
 
     parser = argparse.ArgumentParser(description="STELLAR")
-    parser.add_argument(
-        "--seed", type=int, default=1, metavar="S", help="random seed (default: 1)"
-    )
+    parser.add_argument("--seed", type=int, default=seed, metavar="S")
     parser.add_argument("--name", type=str, default="STELLAR")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--wd", type=float, default=5e-2)
-    parser.add_argument("--input-dim", type=int, default=26)
+    parser.add_argument("--lr", type=float, default=lr)
+    parser.add_argument("--wd", type=float, default=wd)
+    # Don't set input_dim here - let STELLAR set it from the dataset
     parser.add_argument("--num-heads", type=int, default=13)
-    parser.add_argument("--num-seed-class", type=int, default=3)
-    parser.add_argument("--sample-rate", type=float, default=0.5)
-    parser.add_argument(
-        "-b", "--batch-size", default=1, type=int, metavar="N", help="mini-batch size"
-    )
+    parser.add_argument("--num-seed-class", type=int, default=num_seed_class)
+    parser.add_argument("--sample-rate", type=float, default=sample_rate)
+    parser.add_argument("-b", "--batch-size", default=batch_size, type=int, metavar="N")
     parser.add_argument("--distance_thres", default=50, type=int)
     parser.add_argument("--savedir", type=str, default="./")
+
     args = parser.parse_args(args=[])
     args.cuda = torch.cuda.is_available()
     args.device = torch.device("cuda" if args.cuda else "cpu")
-    args.epochs = 50
+    args.epochs = epochs
+    args.distance_thres = distance_thres
+    # Set the number of heads based on the number of cell types (IMPORTANT)
+    args.num_heads = len(adata_train.obs[celltype_col].unique()) + num_seed_class
 
-    # prepare input data
     print("Preparing input data")
+    # Create a mapping between original cell indices and sampled indices
     train_df = adata_train.to_df()
-
-    # add to train_df
     positions_celltype = adata_train.obs[[x_col, y_col, celltype_col]]
-
     train_df = pd.concat([train_df, positions_celltype], axis=1)
 
-    train_df = train_df.sample(n=round(sample_rate * len(train_df)), random_state=1)
+    # Create a key to track the original indices before sampling
+    train_df["original_idx"] = np.arange(len(train_df))
+    # train_df = train_df.sample(n=round(sample_rate * len(train_df)), random_state=1)
 
-    train_X = train_df.iloc[:, 0:-3].values
+    # Get the mapping from sampled indices to original indices
+    sampled_to_original = dict(enumerate(train_df["original_idx"].values))
+    original_to_sampled = {v: k for k, v in sampled_to_original.items()}
+
+    # Remove the helper column
+    train_df = train_df.drop(columns=["original_idx"])
+
+    train_X = train_df.iloc[:, :-3].values
     test_X = adata_unannotated.to_df().values
 
-    train_y = train_df[celltype_col].str.lower()
-    train_y
+    # DO NOT convert to lowercase - keep original cell type labels
+    train_y = train_df[celltype_col].values
 
-    labeled_pos = train_df.iloc[
-        :, -3:-1
-    ].values  # x,y coordinates, indexes depend on specific datasets
+    labeled_pos = train_df.iloc[:, -3:-1].values
     unlabeled_pos = adata_unannotated.obs[[x_col, y_col]].values
 
-    cell_types = np.sort(list(set(train_y))).tolist()
-    cell_types
+    # Print information about the data to help with debugging
+    print(f"Number of unique cell types: {len(np.unique(train_y))}")
+    print(f"Cell types: {np.unique(train_y)[:10]}")
 
+    cell_types = np.sort(list(set(train_y))).tolist()
     cell_type_dict = {}
     inverse_dict = {}
+    for i, t in enumerate(cell_types):
+        cell_type_dict[t] = i
+        inverse_dict[i] = t
 
-    for i, cell_type in enumerate(cell_types):
-        cell_type_dict[cell_type] = i
-        inverse_dict[i] = cell_type
+    # Print dictionaries to verify proper mapping
+    print(f"Cell type mapping size: {len(cell_type_dict)}")
+    print(f"First 3 mappings: {list(cell_type_dict.items())[:3]}")
 
     train_y = np.array([cell_type_dict[x] for x in train_y])
 
-    labeled_edges = stellar_get_edge_index(labeled_pos, distance_thres=distance_thres)
-    unlabeled_edges = stellar_get_edge_index(
-        unlabeled_pos, distance_thres=distance_thres
-    )
+    # If region_column is provided, compute edges per region and concatenate
+    if region_column is not None:
+        labeled_edges_list = []
+        unlabeled_edges_list = []
+        train_regions_map = {}  # To map region cells to train_df indices
 
-    # build dataset
+        # Create a mapping between original cells and their position in the sampled data
+        sampled_cells = set(train_df.index)
+
+        # Get unique regions
+        unique_regions_train = adata_train.obs[region_column].unique()
+        unique_regions_unannot = adata_unannotated.obs[region_column].unique()
+
+        # For each region in annotated data
+        print("Processing labeled data")
+        for region in unique_regions_train:
+            print(f"Processing region: {region}")
+            # Get cells in this region that are also in the sampled training data
+            region_mask_full = adata_train.obs[region_column] == region
+            # Extract positions for just those cells that are in the training data
+            region_cells = adata_train[region_mask_full].obs_names
+            region_sampled_cells = [
+                cell for cell in region_cells if cell in sampled_cells
+            ]
+
+            if len(region_sampled_cells) < 2:
+                print(
+                    f"  Skipping region {region}: too few sampled cells ({len(region_sampled_cells)})"
+                )
+                continue
+
+            # Get positions of sampled cells in this region
+            region_pos = train_df.loc[region_sampled_cells, [x_col, y_col]].values
+
+            # Create mapping from local indices to global training indices
+            local_to_global = {
+                i: original_to_sampled.get(adata_train.obs_names.get_loc(cell), None)
+                for i, cell in enumerate(region_sampled_cells)
+            }
+            local_to_global = {
+                k: v for k, v in local_to_global.items() if v is not None
+            }
+
+            if len(local_to_global) < 2:
+                print(
+                    f"  Skipping region {region}: too few cells with valid mapping ({len(local_to_global)})"
+                )
+                continue
+
+            # Calculate edges using local indices
+            region_edges = stellar_get_edge_index(
+                region_pos,
+                distance_thres=distance_thres,
+                max_memory_usage=max_memory_usage,
+                chunk_size=chunk_size,
+            )
+
+            # Convert to global indices for the training set
+            valid_edges = []
+            for edge in region_edges:
+                src, dst = edge
+                if src in local_to_global and dst in local_to_global:
+                    valid_edges.append([local_to_global[src], local_to_global[dst]])
+
+            if valid_edges:
+                labeled_edges_list.extend(valid_edges)
+
+        # For each region in unannotated data
+        print("Processing unlabeled data")
+        for region in unique_regions_unannot:
+            print(f"Processing region: {region}")
+            region_mask = adata_unannotated.obs[region_column] == region
+            region_indices = np.where(region_mask)[0]
+
+            if len(region_indices) < 2:
+                print(
+                    f"  Skipping region {region}: too few cells ({len(region_indices)})"
+                )
+                continue
+
+            # Get positions
+            region_pos = adata_unannotated.obs.loc[region_mask, [x_col, y_col]].values
+
+            # Calculate edges
+            region_edges = stellar_get_edge_index(
+                region_pos,
+                distance_thres=distance_thres,
+                max_memory_usage=max_memory_usage,
+                chunk_size=chunk_size,
+            )
+
+            # Map local indices to global indices
+            valid_edges = []
+            for edge in region_edges:
+                src_local, dst_local = edge
+                if src_local < len(region_indices) and dst_local < len(region_indices):
+                    src_global = region_indices[src_local]
+                    dst_global = region_indices[dst_local]
+                    if src_global < len(test_X) and dst_global < len(test_X):
+                        valid_edges.append([src_global, dst_global])
+
+            if valid_edges:
+                unlabeled_edges_list.extend(valid_edges)
+
+        # Convert edge lists to arrays
+        if labeled_edges_list:
+            labeled_edges = np.array(labeled_edges_list)
+            # Final sanity check for labeled edges
+            max_allowed_idx = len(train_X) - 1
+            valid_mask = (labeled_edges[:, 0] <= max_allowed_idx) & (
+                labeled_edges[:, 1] <= max_allowed_idx
+            )
+            labeled_edges = labeled_edges[valid_mask]
+        else:
+            labeled_edges = np.array([]).reshape(0, 2)
+
+        if unlabeled_edges_list:
+            unlabeled_edges = np.array(unlabeled_edges_list)
+            # Final sanity check for unlabeled edges
+            max_allowed_idx = len(test_X) - 1
+            valid_mask = (unlabeled_edges[:, 0] <= max_allowed_idx) & (
+                unlabeled_edges[:, 1] <= max_allowed_idx
+            )
+            unlabeled_edges = unlabeled_edges[valid_mask]
+        else:
+            unlabeled_edges = np.array([]).reshape(0, 2)
+
+        print(f"Final labeled edges: {labeled_edges.shape[0]}")
+        print(f"Final unlabeled edges: {unlabeled_edges.shape[0]}")
+    else:
+        # Standard approach with global edge indices
+        labeled_edges = stellar_get_edge_index(
+            labeled_pos,
+            distance_thres=distance_thres,
+            max_memory_usage=max_memory_usage,
+            chunk_size=chunk_size,
+        )
+        unlabeled_edges = stellar_get_edge_index(
+            unlabeled_pos,
+            distance_thres=distance_thres,
+            max_memory_usage=max_memory_usage,
+            chunk_size=chunk_size,
+        )
+
+        # Convert to numpy arrays
+        labeled_edges = np.array(labeled_edges)
+        unlabeled_edges = np.array(unlabeled_edges)
+
+        # Final sanity checks
+        max_train_idx = len(train_X) - 1
+        max_test_idx = len(test_X) - 1
+
+        valid_mask = (labeled_edges[:, 0] <= max_train_idx) & (
+            labeled_edges[:, 1] <= max_train_idx
+        )
+        labeled_edges = labeled_edges[valid_mask]
+
+        valid_mask = (unlabeled_edges[:, 0] <= max_test_idx) & (
+            unlabeled_edges[:, 1] <= max_test_idx
+        )
+        unlabeled_edges = unlabeled_edges[valid_mask]
+
     print("Building dataset")
+    # Debug info to verify edge indices are within bounds
+    print(f"Training data shape: {train_X.shape}, max label index: {len(train_X)-1}")
+    print(f"Testing data shape: {test_X.shape}, max label index: {len(test_X)-1}")
+    if len(labeled_edges) > 0:
+        print(f"Max labeled edge index: {np.max(labeled_edges)}")
+    if len(unlabeled_edges) > 0:
+        print(f"Max unlabeled edge index: {np.max(unlabeled_edges)}")
+
+    # Make sure all edge indices are within bounds
+    if len(labeled_edges) > 0:
+        max_idx = len(train_X) - 1
+        valid_mask = np.all(labeled_edges <= max_idx, axis=1)
+        if not np.all(valid_mask):
+            print(f"Removing {(~valid_mask).sum()} out-of-bounds labeled edges")
+            labeled_edges = labeled_edges[valid_mask]
+
+    if len(unlabeled_edges) > 0:
+        max_idx = len(test_X) - 1
+        valid_mask = np.all(unlabeled_edges <= max_idx, axis=1)
+        if not np.all(valid_mask):
+            print(f"Removing {(~valid_mask).sum()} out-of-bounds unlabeled edges")
+            unlabeled_edges = unlabeled_edges[valid_mask]
+
+    # Ensure we have at least some edges - STELLAR will fail without edges
+    if len(labeled_edges) == 0 or len(unlabeled_edges) == 0:
+        print(
+            "WARNING: No edges found for labeled or unlabeled data - STELLAR requires edges for both datasets"
+        )
+        if len(labeled_edges) == 0:
+            print("Adding token edge to labeled data")
+            labeled_edges = np.array([[0, min(1, len(train_X) - 1)]])
+        if len(unlabeled_edges) == 0:
+            print("Adding token edge to unlabeled data")
+            unlabeled_edges = np.array([[0, min(1, len(test_X) - 1)]])
+
+    # Build dataset
     dataset = GraphDataset(train_X, train_y, test_X, labeled_edges, unlabeled_edges)
 
-    # run stellar
+    # IMPORTANT: Set input dimension correctly from dataset
+    args.input_dim = train_X.shape[1]
+    print(f"Setting input dimension to: {args.input_dim}")
+
     print("Running STELLAR")
     stellar = STELLAR(args, dataset)
-    stellar.train()
-    _, results = stellar.pred()
 
+    # Additional diagnostic info
+    model_params = sum(p.numel() for p in stellar.model.parameters())
+    print(f"Model has {model_params} parameters")
+
+    # Execute training
+    stellar.train()
+
+    # Get predictions
+    uncertainty, results = stellar.pred()
+    print(f"Mean prediction uncertainty: {uncertainty:.4f}")
+
+    # Count predictions per class to check for uniformity
+    unique_preds, counts = np.unique(results, return_counts=True)
+    print("Prediction distribution:")
+    for pred, count in zip(unique_preds, counts):
+        print(f"Class {pred}: {count} cells ({count/len(results)*100:.2f}%)")
+
+    # Convert numerical predictions back to string labels
     results = results.astype("object")
     for i in range(len(results)):
         if results[i] in inverse_dict.keys():
             results[i] = inverse_dict[results[i]]
-    adata_unannotated.obs[key_added] = pd.Categorical(results)
+        else:
+            # Handle new/unseen classes
+            results[i] = f"New_Class_{results[i]}"
 
-    # make stellar_pred a string
-    adata_unannotated.obs["stellar_pred"] = adata_unannotated.obs[
-        "stellar_pred"
-    ].astype(str)
+    adata_unannotated.obs[key_added] = pd.Categorical(results)
+    adata_unannotated.obs[key_added] = adata_unannotated.obs[key_added].astype(str)
 
     return adata_unannotated
 
@@ -2302,80 +2556,113 @@ def adata_stellar(
 def ml_train(
     adata_train,
     label,
-    test_size=0.33,
+    test_size=0.2,
     random_state=0,
-    model="svm",
-    nan_policy_y="raise",
+    nan_policy_y="omit",
+    mode="accurate_SVC",  # 'accurate_SVC' or 'fast_SVC' or 'knn'
     showfig=True,
-    figsize=(10, 8),
+    figsize=(8, 6),
+    n_neighbors=5,  # Number of neighbors for KNN
 ):
     """
-    Train a svm model on the provided data.
+    Train a classifier (SVC, LinearSVC, or KNN) on the data.
 
     Parameters
     ----------
-    adata_train : AnnData
-        The training data as an AnnData object.
+    adata_train : anndata.AnnData
+        The AnnData object containing the training data. The input features are expected in adata_train.X,
+        and the target labels in adata_train.obs[label].
     label : str
-        The label to predict.
+        The column name in adata_train.obs to use as the target variable.
     test_size : float, optional
-        The proportion of the dataset to include in the test split, by default 0.33.
+        The proportion of the dataset to include in the test split. Default is 0.2.
     random_state : int, optional
-        The seed used by the random number generator, by default 0.
-    model : str, optional
-        The type of model to train, by default "svm".
-    nan_policy_y : str, optional
-        How to handle NaNs in the label, by default "raise". Can be either 'omit' or 'raise'.
+        Seed for the random number generator. Default is 0.
+    nan_policy_y : {'omit', 'raise'}, optional
+        Policy for handling NaNs in the target variable. 'omit' removes NaNs, 'raise' raises an error.
+        Default is 'omit'.
+    mode : {'accurate_SVC', 'fast_SVC', 'knn'}, optional
+        The type of classifier to use.
+        - 'accurate_SVC': Uses SVC with probability=True (slower, provides predict_proba).
+        - 'fast_SVC': Uses LinearSVC with CalibratedClassifierCV (faster, optional predict_proba).
+        - 'knn': Uses KNeighborsClassifier with specified n_neighbors.
+        Default is 'accurate_SVC'.
     showfig : bool, optional
-        Whether to show the confusion matrix as a heatmap, by default True.
+        Whether to display a heatmap of the classification report. Default is True.
+    figsize : tuple, optional
+        Size of the figure if showfig is True. Default is (8, 6).
+    n_neighbors : int, optional
+        Number of neighbors for KNN classifier. Default is 5.
 
     Returns
     -------
-    SVC
-        The trained Support Vector Classifier model.
+    svc : sklearn.base.BaseEstimator
+        The trained classifier model. For 'accurate_SVC' and 'fast_SVC', the model supports predict_proba.
+        For 'knn', only predict is available.
 
     Raises
     ------
     ValueError
-        If `nan_policy_y` is not 'omit' or 'raise'.
-    """
-    X = pd.DataFrame(adata_train.X)
-    y = adata_train.obs[label].values
+        If `mode` is not one of the allowed options, or if `nan_policy_y` is not 'omit' or 'raise'.
 
+    Notes
+    -----
+    - The function handles NaNs in the target variable based on `nan_policy_y`.
+    - For 'accurate_SVC', the classifier provides `predict_proba` for probability estimates.
+    - For 'fast_SVC', the classifier uses LinearSVC with calibration for `predict_proba`.
+    - For 'knn', the classifier uses KNeighborsClassifier with the specified `n_neighbors`.
+    - The classification report is displayed as a heatmap if `showfig` is True.
+    - The function prints progress messages (e.g., "Preparing training data!", "Training now!", etc.).
+    """
+    print("Preparing training data!")
+    X = adata_train.X
+    if not isinstance(X, np.ndarray):
+        X = X.toarray()
+    y = adata_train.obs[label].values
     if nan_policy_y == "omit":
-        y_msk = ~y.isna()
+        y_msk = ~pd.isna(y)  # <-- pd.isna works fine with mixed types
         X = X[y_msk]
         y = y[y_msk]
-    elif nan_policy_y == "raise":
-        pass
-    else:
+    elif nan_policy_y != "raise":
         raise ValueError("nan_policy_y must be either 'omit' or 'raise'")
-
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
-
-    print(y.unique().sort_values())
-
+    print("Unique labels:", np.unique(y))  # Adjusted for clarity
     print("Training now!")
-    svc = SVC(kernel="linear", probability=True)
+    if mode == "accurate_SVC":
+        svc = SVC(kernel="linear", probability=True)  # SVC with probability
+    elif mode == "knn":
+        print("Using KNN classifier with n_neighbors = ", n_neighbors)
+        svc = KNeighborsClassifier(n_neighbors=n_neighbors)
+    elif mode == "fast_SVC":
+        base_svc = LinearSVC()
+        svc = CalibratedClassifierCV(
+            base_svc
+        )  # CalibratedClassifierCV to add predict_proba
+    else:
+        raise ValueError("mode must be 'accurate_SVC', 'fast_SVC', or 'knn'")
     svc.fit(X_train, y_train)
-    pred = []
-    y_prob = svc.predict_proba(X_test)
-    y_prob = pd.DataFrame(y_prob)
-    y_prob.columns = svc.classes_
-
-    svm_label = y_prob.idxmax(axis=1, skipna=True)
-    target_names = svc.classes_
     print("Evaluating now!")
+    # Predict probability only for 'accurate' mode
+    if mode == "accurate_SVC":
+        y_prob = svc.predict_proba(X_test)
+        y_prob = pd.DataFrame(y_prob, columns=svc.classes_)
+        svm_label = y_prob.idxmax(axis=1)
+    elif mode == "knn":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    elif mode == "fast_SVC":
+        svm_label = svc.predict(X_test)  # No predict_proba for LinearSVC
+    # Generate classification report
+    target_names = svc.classes_
     svm_eval = classification_report(
         y_true=y_test, y_pred=svm_label, target_names=target_names, output_dict=True
     )
     if showfig:
         plt.figure(figsize=figsize)
         sns.heatmap(pd.DataFrame(svm_eval).iloc[:-1, :].T, annot=True)
+        plt.title(f"Classification Report ({mode})")
         plt.show()
-
     return svc
 
 
@@ -3483,3 +3770,2116 @@ def launch_interactive_clustering(adata=None, output_dir=None):
     main_layout.servable(title="SPACEc Clustering App")
 
     return main_layout
+
+
+# Functions for PPA
+## Adjust clustering parameter to get the desired number of clusters
+def apply_dbscan_clustering(
+    df, min_samples=10, x_col="x", y_col="y", allow_single_cluster=True
+):
+    """
+    Apply DBSCAN clustering to a dataframe and update the cluster labels in the original dataframe.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The dataframe to be clustered.
+    min_cluster_size : int, optional
+        The number of samples in a neighborhood for a point to be considered as a core point, by default 10
+    Returns
+    -------
+    None
+    """
+    # Initialize a new column for cluster labels
+    df["cluster"] = -1
+    # Apply DBSCAN clustering
+    hdbscan = HDBSCAN(
+        min_samples=min_samples,
+        min_cluster_size=5,
+        cluster_selection_epsilon=0.0,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        allow_single_cluster=allow_single_cluster,
+    )
+    coords = df[[x_col, y_col]].values
+    labels = hdbscan.fit_predict(coords)
+    # Number of clusters in labels, ignoring noise if present.
+    n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise_ = list(labels).count(-1)
+    print("Estimated number of clusters: %d" % n_clusters_)
+    print("Estimated number of noise points: %d" % n_noise_)
+    # Update the cluster labels in the original dataframe
+    df.loc[df.index, "cluster"] = labels
+
+
+def identify_points_in_proximity(
+    df,
+    full_df,
+    identification_column,
+    cluster_column="cluster",
+    x_column="x",
+    y_column="y",
+    radius=200,
+    edge_neighbours=3,
+    plot=True,
+    concave_hull_length_threshold=50,
+    concavity=2,
+):
+    """
+    Identify points in proximity within clusters and generate result and outline DataFrames.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the points to be processed.
+    full_df : pandas.DataFrame
+        Full DataFrame containing all points.
+    identification_column : str
+        Column name used for identification.
+    cluster_column : str, optional
+        Column name for cluster labels, by default "cluster".
+    x_column : str, optional
+        Column name for x-coordinates, by default "x".
+    y_column : str, optional
+        Column name for y-coordinates, by default "y".
+    radius : int, optional
+        Radius for proximity search, by default 200.
+    edge_neighbours : int, optional
+        Number of edge neighbours, by default 3.
+    plot : bool, optional
+        Whether to plot the results, by default True.
+    concave_hull_length_threshold : int, optional
+        Threshold for concave hull length, by default 50.
+
+    Returns
+    -------
+    result : pandas.DataFrame
+        DataFrame containing the result points.
+    outlines : pandas.DataFrame
+        DataFrame containing the outline points.
+    """
+
+    nbrs, unique_clusters = precompute(
+        df, x_column, y_column, full_df, identification_column, edge_neighbours
+    )
+    num_processes = max(
+        1, os.cpu_count() - 1
+    )  # Use all available CPUs minus 2, but at least 1
+    with Pool(processes=num_processes) as pool:
+        results = pool.starmap(
+            process_cluster,
+            [
+                (
+                    (
+                        df,
+                        cluster,
+                        cluster_column,
+                        x_column,
+                        y_column,
+                        concave_hull_length_threshold,
+                        edge_neighbours,
+                        full_df,
+                        radius,
+                        plot,
+                        identification_column,
+                        concavity,
+                    ),
+                    nbrs,
+                    unique_clusters,
+                )
+                for cluster in set(df[cluster_column]) - {-1}
+            ],
+        )
+    # Unpack the results
+    result_list, outline_list = zip(*results)
+    # Concatenate the list of DataFrames into a single result DataFrame
+    if len(result_list) > 0:
+        result = pd.concat(result_list)
+    else:
+        result = pd.DataFrame(
+            columns=[x_column, y_column, "patch_id", identification_column]
+        )
+    if len(outline_list) > 0:
+        outlines = pd.concat(outline_list)
+    else:
+        outlines = pd.DataFrame(
+            columns=[x_column, y_column, "patch_id", identification_column]
+        )
+    return result, outlines
+
+
+# Precompute nearest neighbors model and unique clusters
+def precompute(df, x_column, y_column, full_df, identification_column, edge_neighbours):
+    """
+    Precompute nearest neighbors and unique clusters.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the points to be processed.
+    x_column : str
+        Column name for x-coordinates.
+    y_column : str
+        Column name for y-coordinates.
+    full_df : pandas.DataFrame
+        Full DataFrame containing all points.
+    identification_column : str
+        Column name used for identification.
+    edge_neighbours : int
+        Number of edge neighbours.
+
+    Returns
+    -------
+    nbrs : sklearn.neighbors.NearestNeighbors
+        Fitted NearestNeighbors model.
+    unique_clusters : numpy.ndarray
+        Array of unique cluster identifiers.
+    """
+    nbrs = NearestNeighbors(n_neighbors=edge_neighbours).fit(df[[x_column, y_column]])
+    unique_clusters = full_df[identification_column].unique()
+    return nbrs, unique_clusters
+
+
+def process_cluster(args, nbrs, unique_clusters):
+    (
+        df,
+        cluster,
+        cluster_column,
+        x_column,
+        y_column,
+        concave_hull_length_threshold,
+        edge_neighbours,
+        full_df,
+        radius,
+        plot,
+        identification_column,
+        concavity,
+    ) = args
+
+    """
+    Process a single cluster to identify points in proximity and generate hull points.
+
+    Parameters
+    ----------
+    args : tuple
+        Tuple containing the following elements:
+        - df : pandas.DataFrame
+            DataFrame containing the points to be processed.
+        - cluster : int
+            Cluster identifier.
+        - cluster_column : str
+            Column name for cluster labels.
+        - x_column : str
+            Column name for x-coordinates.
+        - y_column : str
+            Column name for y-coordinates.
+        - concave_hull_length_threshold : int
+            Threshold for concave hull length.
+        - edge_neighbours : int
+            Number of edge neighbours.
+        - full_df : pandas.DataFrame
+            Full DataFrame containing all points.
+        - radius : int
+            Radius for proximity search.
+        - plot : bool
+            Whether to plot the results.
+        - identification_column : str
+            Column name used for identification.
+        - concavity : int
+            Concavity parameter for hull generation.
+    nbrs : sklearn.neighbors.NearestNeighbors
+        Fitted NearestNeighbors model.
+    unique_clusters : numpy.ndarray
+        Array of unique cluster identifiers.
+
+    Returns
+    -------
+    prox_points : pandas.DataFrame
+        DataFrame containing points within the proximity of the cluster.
+    hull_nearest_neighbors : pandas.DataFrame
+        DataFrame containing the nearest neighbors of the hull points.
+    """
+
+    # Filter DataFrame for the current cluster
+    subset = df.loc[df[cluster_column] == cluster]
+    points = subset[[x_column, y_column]].values
+    # Compute concave hull indexes
+    idxes = concave_hull_indexes(
+        points[:, :2],
+        length_threshold=concave_hull_length_threshold,
+        concavity=concavity,
+    )
+    # Get hull points from the DataFrame
+    hull_points = pd.DataFrame(points[idxes], columns=[x_column, y_column])
+    # Find nearest neighbors of hull points in the original DataFrame
+    distances, indices = nbrs.kneighbors(hull_points[[x_column, y_column]])
+    hull_nearest_neighbors = df.iloc[indices.flatten()]
+
+    # Convert radius to a list if it's a single value
+    if not isinstance(radius, (list, tuple, np.ndarray)):
+        radius_list = [radius]
+    else:
+        radius_list = radius
+
+    # Extract hull points coordinates
+    hull_coords = hull_nearest_neighbors[[x_column, y_column]].values
+    # Calculate distances from all points in full_df to all hull points
+    distances = cdist(full_df[[x_column, y_column]].values, hull_coords)
+
+    # Process each radius
+    all_prox_points = []
+    for r in radius_list:
+        # Identify points within the circle for each hull point
+        in_circle = distances <= r
+        # Identify points from a different cluster for each hull point
+        diff_cluster = (
+            full_df[identification_column].values[:, np.newaxis]
+            != hull_nearest_neighbors[identification_column].values
+        )
+        # Combine the conditions
+        in_circle_diff_cluster = in_circle & diff_cluster
+        # Collect all points within the circle but from a different cluster
+        r_in_circle_diff_cluster = full_df[np.any(in_circle_diff_cluster, axis=1)]
+        # Remove duplicates
+        r_prox_points = r_in_circle_diff_cluster.drop_duplicates()
+        # Add patch_id and distance_from_patch columns
+        r_prox_points["patch_id"] = cluster
+        r_prox_points["distance_from_patch"] = r
+
+        all_prox_points.append(r_prox_points)
+
+    # Combine results from all radii
+    if all_prox_points:
+        prox_points = pd.concat(all_prox_points, ignore_index=True)
+        # If multiple radii were used, keep only the smallest distance for each point
+        if len(radius_list) > 1:
+            prox_points = prox_points.sort_values(
+                "distance_from_patch"
+            ).drop_duplicates(
+                subset=[
+                    col for col in prox_points.columns if col != "distance_from_patch"
+                ]
+            )
+    else:
+        # Create empty DataFrame with appropriate columns
+        prox_points = pd.DataFrame(
+            columns=full_df.columns.tolist() + ["patch_id", "distance_from_patch"]
+        )
+
+    return prox_points, hull_nearest_neighbors
+
+
+def identify_hull_points(
+    df,
+    cluster_column="cluster",
+    x_col="x",
+    y_col="y",
+    concave_hull_length_threshold=50,
+    concavity=2,
+):
+    """
+    Identify hull points with improved performance.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing spatial points and cluster labels.
+    cluster_column : str, optional
+        Column name for clusters, by default "cluster".
+    x_col : str, optional
+        Column name for the x-coordinate, by default "x".
+    y_col : str, optional
+        Column name for the y-coordinate, by default "y".
+    concave_hull_length_threshold : int, optional
+        Threshold for concave hull length, by default 50.
+    concavity : int, optional
+        Concavity parameter, by default 2.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame of hull points sorted by patch_id and order.
+    """
+    clusters = sorted(set(df[cluster_column].unique()) - {-1})
+    if not clusters:
+        return pd.DataFrame(columns=[x_col, y_col, "patch_id"])
+
+    hullpoints_list = []
+    for cluster in clusters:
+        mask = df[cluster_column] == cluster
+        subset = df[mask]
+        points = subset[[x_col, y_col]].values
+        if len(points) < 3:
+            continue
+        idxes = concave_hull_indexes(
+            points, concavity=concavity, length_threshold=concave_hull_length_threshold
+        )
+        hull_points = subset.iloc[idxes].reset_index(drop=True)
+        hull_points["order"] = range(len(hull_points))
+        hull_points["patch_id"] = cluster
+        hullpoints_list.append(hull_points)
+
+    if not hullpoints_list:
+        return pd.DataFrame(columns=[x_col, y_col, "patch_id"])
+
+    hull = pd.concat(hullpoints_list, ignore_index=True, sort=False)
+    return hull.sort_values(by=["patch_id", "order"]).drop(columns="order")
+
+
+def convert_dataframe_to_geojson(
+    df,
+    output_dir,
+    region_name=None,
+    x="x",
+    y="y",
+    sample_col=None,
+    region_col="unique_region",
+    patch_col="patch_id",
+    geojson_prefix="hull_coordinates",
+    save_geojson=True,
+):
+    """
+    Convert a DataFrame into GeoJSON format with optional saving to file.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input DataFrame with spatial coordinates.
+    output_dir : str
+        Directory in which GeoJSON files will be saved.
+    region_name : str, optional
+        Optional region name to create a subfolder, by default None.
+    x : str, optional
+        Column name for the x-coordinate, by default "x".
+    y : str, optional
+        Column name for the y-coordinate, by default "y".
+    sample_col : str, optional
+        Column name to separate by samples, by default None.
+    region_col : str, optional
+        Column name for the region, by default "unique_region".
+    patch_col : str, optional
+        Column name for the patch, by default "patch_id".
+    geojson_prefix : str, optional
+        Prefix for the GeoJSON filename, by default "hull_coordinates".
+    save_geojson : bool, optional
+        Whether to save the GeoJSON to disk, by default True.
+
+    Returns
+    -------
+    list of dict
+        Each dictionary contains a filename and the GeoJSON feature collection.
+    """
+    required_columns = [region_col, patch_col, x, y]
+    if sample_col is not None:
+        required_columns.append(sample_col)
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        raise KeyError(f"Missing required columns in dataframe: {missing_cols}")
+
+    if save_geojson:
+        if region_name is not None:
+            region_dir = os.path.join(output_dir, f"region_{region_name}")
+            os.makedirs(region_dir, exist_ok=True)
+        else:
+            region_dir = output_dir
+            os.makedirs(region_dir, exist_ok=True)
+
+    geojson_results = []
+    sample_values = df[sample_col].unique() if sample_col is not None else [None]
+    for sample in sample_values:
+        if sample is None:
+            sample_df = df
+            sample_label = "all"
+        else:
+            sample_df = df[df[sample_col] == sample]
+            sample_search = re.search(r"\d+", str(sample))
+            sample_label = sample_search.group() if sample_search else str(sample)
+
+        for region in sample_df[region_col].unique():
+            region_df = sample_df[sample_df[region_col] == region]
+            features, skipped, region_label = process_geojson_region(
+                region_df, region, region_col, patch_col, x, y, sample_label
+            )
+            all_features = features
+            if sample is not None:
+                filename = f"{geojson_prefix}_sample-{sample_label}_region-{region_label}_separate_coordinates.geojson"
+            else:
+                filename = f"{geojson_prefix}_region-{region_label}_separate_coordinates.geojson"
+            geojson_dict = {
+                "type": "FeatureCollection",
+                "features": all_features,
+                "name": filename,
+            }
+            if save_geojson:
+                geojson_path = os.path.join(region_dir, filename)
+                with open(geojson_path, "w") as f:
+                    json.dump(geojson_dict, f)
+            geojson_results.append({"filename": filename, "geojson": geojson_dict})
+        if skipped:
+            print(f"Skipped {len(skipped)} clusters with insufficient points")
+    return geojson_results
+
+
+def process_geojson_region(
+    region_df, region, region_col, patch_col, x, y, sample_label="all"
+):
+    """
+    Process a single region to generate GeoJSON features.
+
+    Parameters
+    ----------
+    region_df : pandas.DataFrame
+        Subset DataFrame for the region.
+    region : any
+        Region identifier used to extract a label.
+    region_col : str
+        Column name indicating region information.
+    patch_col : str
+        Column name for patch identifiers.
+    x : str
+        Column name for x-coordinate.
+    y : str
+        Column name for y-coordinate.
+    sample_label : str, optional
+        Label for sample grouping, by default "all".
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - features (list): List of GeoJSON feature dictionaries.
+        - skipped_clusters (list): List of clusters skipped due to insufficient points.
+        - region_label (str): Extracted region label.
+    """
+    region_search = re.search(r"\d+", str(region))
+    region_label = region_search.group() if region_search else str(region)
+    features = []
+    skipped_clusters = []
+    for cluster, cluster_df in region_df.groupby(patch_col):
+        coordinates = cluster_df[[x, y]].values.tolist()
+        if len(coordinates) >= 3:
+            geom_type = "Polygon"
+            coords_format = [coordinates]
+        elif len(coordinates) == 2:
+            geom_type = "LineString"
+            coords_format = coordinates
+        else:
+            skipped_clusters.append((sample_label, region_label, cluster))
+            continue
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "sample": (
+                    int(sample_label) if str(sample_label).isdigit() else sample_label
+                ),
+                "region": (
+                    int(region_label) if str(region_label).isdigit() else region_label
+                ),
+                "cluster": int(cluster) if str(cluster).isdigit() else cluster,
+            },
+            "geometry": {
+                "type": geom_type,
+                "coordinates": coords_format,
+            },
+        }
+        features.append(feature)
+    return features, skipped_clusters, region_label
+
+
+def extract_region_number(unique_region_value):
+    """
+    Extract the numeric part of a region identifier.
+
+    Parameters
+    ----------
+    unique_region_value : int, float, or str
+        The region value from which to extract digits.
+
+    Returns
+    -------
+    str
+        The numeric region value as a string.
+    """
+    try:
+        if isinstance(unique_region_value, (int, float)):
+            return str(int(unique_region_value))
+        digits = "".join(filter(str.isdigit, str(unique_region_value)))
+        return str(int(digits)) if digits else str(unique_region_value)
+    except ValueError:
+        return str(unique_region_value)
+
+
+def analyze_peripheral_cells(
+    patches_gdf, codex_gdf, buffer_distances, original_unit_scale, tolerance_distance
+):
+    """
+    Analyze peripheral cells with parallel processing.
+
+    Parameters
+    ----------
+    patches_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with patch geometries.
+    codex_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with codex point geometries.
+    buffer_distances : list of int
+        List of distances to buffer.
+    original_unit_scale : float
+        Scale factor for the units.
+    tolerance_distance : float
+        Tolerance for determining peripheral regions.
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - results (dict): Dictionary with keys as distances and values as DataFrames of peripheral cells.
+        - buffer_geometries (dict): Dictionary with buffer geometries for visualization.
+    """
+    region_tasks = []
+    for region_name, region_patches in patches_gdf.groupby("region_numeric"):
+        region_codex_cells = codex_gdf[
+            codex_gdf["unique_region_numeric"] == region_name
+        ]
+        if len(region_codex_cells) > 0:
+            region_tasks.append(
+                (
+                    region_name,
+                    region_patches,
+                    region_codex_cells,
+                    buffer_distances,
+                    original_unit_scale,
+                    tolerance_distance,
+                )
+            )
+    results = {dist: [] for dist in buffer_distances}
+    buffer_geometries = {dist: [] for dist in buffer_distances}
+    max_workers = min(os.cpu_count(), len(region_tasks))
+    if max_workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            for region_name, region_results, region_buffers in executor.map(
+                process_region_peripheral_cells, region_tasks
+            ):
+                for dist, df in region_results.items():
+                    if not df.empty:
+                        results[dist].append(df)
+                for dist, buffers in region_buffers.items():
+                    buffer_geometries[dist].extend(buffers)
+    else:
+        for task in region_tasks:
+            region_name, region_results, region_buffers = (
+                process_region_peripheral_cells(task)
+            )
+            for dist, df in region_results.items():
+                if not df.empty:
+                    results[dist].append(df)
+            for dist, buffers in region_buffers.items():
+                buffer_geometries[dist].extend(buffers)
+    for dist in buffer_distances:
+        if results[dist]:
+            results[dist] = pd.concat(results[dist], ignore_index=True)
+        else:
+            results[dist] = pd.DataFrame()
+    return results, buffer_geometries
+
+
+def save_peripheral_cells(results, unit_name, region_name, output_dir, save_csv=True):
+    """
+    Save peripheral cells for each buffer distance to CSV files.
+
+    Parameters
+    ----------
+    results : dict
+        Dictionary with keys as distances and values as DataFrames of peripheral cells.
+    unit_name : str
+        Name of the unit to include in filenames.
+    region_name : str
+        Region identifier used in filenames.
+    output_dir : str
+        Directory to save CSV files.
+    save_csv : bool, optional
+        Whether to save CSV files, by default True.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Combined DataFrame of peripheral cells from all distances.
+    """
+    all_frames = []
+    if save_csv:
+        region_dir = os.path.join(output_dir, f"region_{region_name}")
+        os.makedirs(region_dir, exist_ok=True)
+    for dist, data in results.items():
+        if data.empty:
+            continue
+        data["dist"] = dist
+        all_frames.append(data)
+        if save_csv:
+            peripheral_path = os.path.join(
+                region_dir,
+                f"{unit_name}_region_{region_name}_peripheral_cells_{dist}um.csv",
+            )
+            data.to_csv(peripheral_path, index=False)
+    combined_df = (
+        pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+    )
+    if save_csv and not combined_df.empty:
+        combined_path = os.path.join(
+            region_dir,
+            f"{unit_name}_region_{region_name}_peripheral_cells_combined.csv",
+        )
+        combined_df.to_csv(combined_path, index=False)
+    return combined_df
+
+
+def process_region_peripheral_cells(args):
+    """
+    Process peripheral cells for a given region (for parallel processing).
+
+    Parameters
+    ----------
+    args : tuple
+        A tuple containing:
+        - region_name : any
+          Region identifier.
+        - region_patches : geopandas.GeoDataFrame
+          GeoDataFrame of patches in the region.
+        - region_codex_cells : geopandas.GeoDataFrame
+          GeoDataFrame of codex cells in the region.
+        - buffer_distances : list of int
+          List of distances to buffer.
+        - original_unit_scale : float
+          Original unit scale for distance conversion.
+        - tolerance_distance : float
+          Tolerance for buffering.
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - region_name : any
+        - results : dict
+          Dictionary with peripheral cell DataFrames for each distance.
+        - buffer_geometries : dict
+          Dictionary with buffer geometry information.
+    """
+    (
+        region_name,
+        region_patches,
+        region_codex_cells,
+        buffer_distances,
+        original_unit_scale,
+        tolerance_distance,
+    ) = args
+    region_codex_cells_sindex = region_codex_cells.sindex
+    results = {dist: [] for dist in buffer_distances}
+    buffer_geometries = {dist: [] for dist in buffer_distances}
+    for _, patch in region_patches.iterrows():
+        patch_polygon = patch["geometry"]
+        cluster_label = patch["cluster"]
+        patch_id = patch.name
+        for dist in buffer_distances:
+            scaled_dist = dist / original_unit_scale
+            expanded_patch = patch_polygon.buffer(scaled_dist)
+            peripheral_region = expanded_patch.difference(patch_polygon).buffer(
+                tolerance_distance
+            )
+            buffer_geometries[dist].append(
+                {
+                    "patch_id": patch_id,
+                    "cluster": cluster_label,
+                    "original": patch_polygon,
+                    "expanded": expanded_patch,
+                    "peripheral": peripheral_region,
+                }
+            )
+            possible_matches_idx = list(
+                region_codex_cells_sindex.intersection(peripheral_region.bounds)
+            )
+            possible_matches = region_codex_cells.iloc[possible_matches_idx]
+            mask = possible_matches.geometry.within(peripheral_region)
+            peripheral_cells = possible_matches[mask].copy()
+            peripheral_cells["cluster"] = cluster_label
+            peripheral_cells["buffer_distance"] = dist
+            peripheral_cells["patch_id"] = patch_id
+            results[dist].append(peripheral_cells)
+    for dist in buffer_distances:
+        if results[dist]:
+            results[dist] = pd.concat(results[dist], ignore_index=True)
+        else:
+            results[dist] = pd.DataFrame()
+    return region_name, results, buffer_geometries
+
+
+def extract_unit_name(geojson):
+    """
+    Extract a unit name from a GeoJSON object.
+
+    Parameters
+    ----------
+    geojson : dict or object with attribute 'name'
+        The GeoJSON object or an object having a 'name' property.
+
+    Returns
+    -------
+    str
+        The extracted unit name.
+
+    Raises
+    ------
+    ValueError
+        If the GeoJSON does not have a 'name' property.
+    """
+    if hasattr(geojson, "name"):
+        file_name = geojson.name
+    elif isinstance(geojson, dict) and "name" in geojson:
+        file_name = geojson["name"]
+    else:
+        raise ValueError("GeoJSON object does not have a 'name' property")
+    file_name_no_ext = os.path.splitext(file_name)[0]
+    parts = file_name_no_ext.split("_")
+    if "ppa" in parts:
+        return "_".join(parts[: parts.index("ppa")])
+    return file_name_no_ext
+
+
+def patch_proximity_analysis(
+    adata,
+    region_column,
+    patch_column,
+    group,
+    min_cluster_size=80,
+    x_column="x",
+    y_column="y",
+    radius=128,
+    edge_neighbours=1,
+    plot=True,
+    savefig=False,
+    output_dir="./",
+    output_fname="",
+    save_geojson=True,
+    allow_single_cluster=True,
+    method="border_cell_radius",
+    concave_hull_length_threshold=50,
+    concavity=2,
+    original_unit_scale=1,
+    tolerance_distance=0.001,
+    key_name=None,
+):
+    """
+    Performs a proximity analysis on patches of a given group within each region of a dataset.
+
+    This function processes an AnnData object by extracting its cell observations and performing
+    proximity analysis on a specified cell group (e.g. a cell type or neighborhood) within each
+    region. Depending on the chosen method ("border_cell_radius" or "hull_expansion"), the analysis
+    applies DBSCAN clustering, identifies concave hull boundaries, and then either determines nearby
+    cells based on a fixed search radius or uses a peripheral buffering approach. Optionally, the
+    function can plot visualization of the analysis and save outputs (figures, CSV files, and GeoJSON).
+
+    Parameters
+    ----------
+    adata : AnnData
+        The annotated data matrix of shape (n_obs x n_vars). Rows correspond to individual cells
+        and columns to gene expression or other features.
+    region_column : str
+        The name of the column in adata.obs that contains region information.
+    patch_column : str
+        The name of the column in adata.obs that contains patch (or group) information.
+    group : str
+        The specific group (e.g. cell type or patch identifier) on which the proximity analysis
+        is to be performed.
+    min_cluster_size : int, optional
+        The minimum number of cells required in a region to perform the analysis. Regions with fewer
+        cells than this value will be skipped. Default is 80.
+    x_column : str, optional
+        The column name in adata.obs corresponding to the x-coordinate of each cell. Default is "x".
+    y_column : str, optional
+        The column name in adata.obs corresponding to the y-coordinate of each cell. Default is "y".
+    radius : int, optional
+        The distance (in spatial units) within which points are considered to be in proximity.
+        This value is multiplied by original_unit_scale. Default is 128.
+    edge_neighbours : int, optional
+        The number of neighbouring edge points to consider when identifying proximity relationships.
+        Default is 1.
+    plot : bool, optional
+        Whether to generate and display visualizations of the proximity analysis. Default is True.
+    savefig : bool, optional
+        Whether to save the generated figure to disk. Default is False.
+    output_dir : str, optional
+        The directory in which to save output files (figures, CSVs, or GeoJSON files). Default is "./".
+    output_fname : str, optional
+        The filename prefix to use when saving figures. Default is an empty string.
+    save_geojson : bool, optional
+        Whether to convert certain results to GeoJSON format and save them. Default is True.
+    allow_single_cluster : bool, optional
+        If True, allows DBSCAN to assign all cells to a single cluster even if no separate clusters
+        exist. Default is True.
+    method : str, optional
+        The analysis method to use. Options are "border_cell_radius" (default) or "hull_expansion".
+        Each method applies a different strategy for proximity detection.
+    concave_hull_length_threshold : int, optional
+        Threshold value used for generating the concave hull boundary. Default is 50.
+    concavity : int, optional
+        Parameter specifying the degree of concavity when calculating the hull boundary. Default is 2.
+    original_unit_scale : int or float, optional
+        A scaling factor to convert the radius from its given unit to the coordinate system unit.
+        Default is 1.
+    tolerance_distance : float, optional
+        Tolerance value for buffering in the peripheral analysis (used when method is "hull_expansion").
+        Default is 0.001.
+    key_name : str, optional
+        The key under which the final proximity analysis results are stored in adata.uns. If not
+        provided, defaults to "ppa_result".
+
+    Returns
+    -------
+    final_results : pandas.DataFrame
+        A DataFrame containing the combined proximity analysis results from all processed regions.
+        It includes, among other information, a newly generated "unique_patch_ID" column that
+        concatenates the region, group, and patch identifier.
+    outlines_results : pandas.DataFrame
+        A DataFrame containing the outline (or hull) points corresponding to the patches; useful for
+        visualization or further spatial analysis.
+    """
+    # multiply radius by original_unit_scale
+    if isinstance(radius, (list, tuple)):
+        radius = [r * original_unit_scale for r in radius]
+    else:
+        radius = radius * original_unit_scale
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    distance_from_patch = radius
+    # make list
+    if isinstance(distance_from_patch, int):
+        distance_from_patch = [distance_from_patch]
+
+    # Get data from adata
+    df = adata.obs
+
+    # Check if the required columns are present in the DataFrame
+    if region_column not in df.columns:
+        raise ValueError(f"Column '{region_column}' not found in adata.obs")
+    if patch_column not in df.columns:
+        raise ValueError(f"Column '{patch_column}' not found in adata.obs")
+    if group not in df[patch_column].unique():
+        raise ValueError(f"Group '{group}' not found in column '{patch_column}'")
+
+    # Convert categorical columns to string once
+    for col in df.select_dtypes(["category"]).columns:
+        df[col] = df[col].astype(str)
+
+    # list to store results for each region
+    region_results = []
+    outlines = []
+
+    for region in df[region_column].unique():
+        df_region = df[df[region_column] == region].copy()
+
+        df_community = df_region[df_region[patch_column] == group].copy()
+
+        # Check if region is large enough
+        if df_community.shape[0] < min_cluster_size:
+            print(f"No {group} in {region}")
+            continue
+        else:
+            print(f"Processing {region}_{group}")
+            # Create region directory
+            if save_geojson or (plot and savefig):
+                region_dir = os.path.join(output_dir, f"region_{region}")
+                os.makedirs(region_dir, exist_ok=True)
+
+            apply_dbscan_clustering(
+                df_community,
+                min_samples=min_cluster_size,
+                x_col=x_column,
+                y_col=y_column,
+                allow_single_cluster=allow_single_cluster,
+            )
+
+            # Identify hull points
+            hull = identify_hull_points(
+                df_community,
+                cluster_column="cluster",
+                x_col=x_column,
+                y_col=y_column,
+                concave_hull_length_threshold=concave_hull_length_threshold,
+                concavity=concavity,
+            )
+            # Skip if no clusters were found
+            if hull.empty:
+                print(f"No clusters found for region {region}.")
+                continue
+
+            if method == "border_cell_radius":
+                results, hull_nearest_neighbors = identify_points_in_proximity(
+                    df=df_community,
+                    full_df=df_region,
+                    cluster_column="cluster",
+                    identification_column=patch_column,
+                    x_column=x_column,
+                    y_column=y_column,
+                    radius=radius,
+                    edge_neighbours=edge_neighbours,
+                    plot=plot,
+                    concave_hull_length_threshold=concave_hull_length_threshold,
+                    concavity=concavity,
+                )
+
+                # add hull_nearest_neighbors to list
+                outlines.append(hull_nearest_neighbors)
+
+                # Convert to GeoJSON
+                if save_geojson:
+                    geojson_results = convert_dataframe_to_geojson(
+                        df=hull,
+                        output_dir=output_dir,
+                        region_name=region,
+                        x=x_column,
+                        y=y_column,
+                        region_col="unique_region",
+                        patch_col="patch_id",
+                        save_geojson=save_geojson,
+                    )
+
+                # Create visualizations for border_cell_radius method
+                if plot:
+                    try:
+                        fig = create_visualization_border_cell_radius(
+                            region_name=region,
+                            group_name=group,
+                            df_community=df_community,
+                            df_full=df_region,
+                            cluster_column="cluster",
+                            identification_column=patch_column,
+                            x_column=x_column,
+                            y_column=y_column,
+                            radius=radius,
+                            hull_points=hull,
+                            proximity_results=results,
+                            hull_neighbors=hull_nearest_neighbors,
+                        )
+
+                        if savefig:
+                            plot_path = os.path.join(
+                                region_dir if region_dir else output_dir,
+                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf",
+                            )
+                            # Save with higher quality and proper bounds
+                            fig.savefig(
+                                plot_path, bbox_inches="tight", dpi=300, format="pdf"
+                            )
+                            print(f"Saved visualization to: {plot_path}")
+                        else:
+                            plt.show()
+
+                        plt.close(fig)  # Ensure figure is closed to free memory
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to create visualization for region {region}: {str(e)}"
+                        )
+
+                print(f"Finished {region}_{group}")
+
+                # append to region_results
+                region_results.append(results)
+
+            elif method == "hull_expansion":
+                geojson_results = convert_dataframe_to_geojson(
+                    df=hull,
+                    output_dir=output_dir,
+                    region_name=region,
+                    x=x_column,
+                    y=y_column,
+                    region_col="unique_region",
+                    patch_col="patch_id",
+                    save_geojson=save_geojson,
+                )
+
+                # Create GeoDataFrames once per region
+                patches_gdf = gpd.GeoDataFrame.from_features(
+                    geojson_results[0]["geojson"]["features"]
+                )
+                codex_points = gpd.points_from_xy(
+                    df_region[x_column], df_region[y_column]
+                )
+                codex_gdf = gpd.GeoDataFrame(df_region, geometry=codex_points)
+                codex_gdf.set_crs(patches_gdf.crs, inplace=True)
+
+                # Extract region numbers once
+                patches_gdf["region_numeric"] = patches_gdf["region"].apply(
+                    extract_region_number
+                )
+                codex_gdf["unique_region_numeric"] = df_region[region_column].apply(
+                    extract_region_number
+                )
+
+                # Run peripheral analysis with buffer geometries
+                buffer_results, buffer_geometries = analyze_peripheral_cells(
+                    patches_gdf=patches_gdf,
+                    codex_gdf=codex_gdf,
+                    buffer_distances=distance_from_patch,
+                    original_unit_scale=original_unit_scale,
+                    tolerance_distance=tolerance_distance,
+                )
+
+                # Save results
+                unit_name = extract_unit_name(geojson_results[0]["geojson"])
+                combined_df = save_peripheral_cells(
+                    results=buffer_results,
+                    unit_name=unit_name,
+                    region_name=region,
+                    output_dir=output_dir,
+                    save_csv=False,
+                )
+
+                # rename dist to distance_from_patch
+                combined_df.rename(
+                    columns={"dist": "distance_from_patch"}, inplace=True
+                )
+
+                # remove column unique_region_numeric and buffer_distance
+                combined_df.drop(
+                    columns=["unique_region_numeric", "buffer_distance"],
+                    inplace=True,
+                    errors="ignore",
+                )
+
+                # remove duplicates
+                combined_df = combined_df.drop_duplicates(
+                    subset=[x_column, y_column, "patch_id", "distance_from_patch"]
+                )
+
+                # append to region_results
+                region_results.append(combined_df)
+                outlines.append(hull)
+
+                if plot:
+                    try:
+                        fig = create_visualization_hull_expansion(
+                            region=region,
+                            group=group,
+                            df_community=df_community,
+                            hull=hull,
+                            patches_gdf=patches_gdf,
+                            df_region=df_region,
+                            buffer_geometries=buffer_geometries,
+                            peripheral_results=buffer_results,
+                            x_column=x_column,
+                            y_column=y_column,
+                            buffer_distances=distance_from_patch,
+                            original_unit_scale=original_unit_scale,
+                        )
+
+                        if savefig:
+                            plot_path = os.path.join(
+                                region_dir if region_dir else output_dir,
+                                f"{output_fname}_patch_proximity_analysis_region_{region}.pdf",
+                            )
+                            # Save with higher quality and proper bounds
+                            fig.savefig(
+                                plot_path, bbox_inches="tight", dpi=300, format="pdf"
+                            )
+                            print(f"Saved visualization to: {plot_path}")
+                        else:
+                            plt.show()
+
+                        plt.close(fig)  # Ensure figure is closed to free memory
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to create visualization for region {region}: {str(e)}"
+                        )
+
+            else:
+                raise ValueError(
+                    f"Unknown method: {method}. Please choose either 'border_cell_radius' or 'hull_expansion'."
+                )
+
+    # Concatenate all results into a single DataFrame
+    final_results = pd.concat(region_results)
+
+    outlines_results = pd.concat(outlines)
+
+    # add as key to adata.uns
+    if key_name is None:
+        key_name = "ppa_result"
+    if key_name in adata.uns:
+        adata.uns[key_name] = pd.concat([adata.uns[key_name], final_results])
+    else:
+        adata.uns[key_name] = final_results
+
+    # generate new column named unique_patch_ID that combines the region, group and patch ID
+    final_results["unique_patch_ID"] = (
+        final_results[region_column]
+        + "_"
+        + final_results[patch_column]
+        + "_"
+        + "patch_no_"
+        + final_results["patch_id"].astype(str)
+    )
+
+    return final_results, outlines_results
+
+
+def create_visualization_hull_expansion(
+    region,
+    group,
+    df_community,
+    hull,
+    patches_gdf,
+    df_region,
+    buffer_geometries,
+    peripheral_results,
+    x_column,
+    y_column,
+    buffer_distances,
+    original_unit_scale,
+    figsize=(20, 16),
+):
+    """
+    Create comprehensive visualization of the patch proximity analysis.
+
+    This function creates a multi-panel figure that visualizes the complete workflow of the analysis,
+    including original clustering of cells, identification of concave hull boundaries, visualization
+    of expanded buffer zones, and detection of peripheral cells near the patch boundaries.
+
+    Parameters
+    ----------
+    region : str
+        Name of the region to be analyzed.
+    group : str
+        Name of the cell group (or category) under investigation.
+    df_community : pandas.DataFrame
+        DataFrame containing the subset of cells (community) used for clustering and further analysis.
+    hull : pandas.DataFrame
+        DataFrame with hull points that form the concave boundaries of clusters.
+    patches_gdf : geopandas.GeoDataFrame
+        GeoDataFrame containing the patch geometries for visualization.
+    df_region : pandas.DataFrame
+        DataFrame containing all cells in the region for contextual plotting.
+    buffer_geometries : dict
+        Dictionary mapping each buffer distance to a list of buffer geometry objects (expanded polygons).
+    peripheral_results : dict
+        Dictionary mapping each buffer distance to a DataFrame of peripheral cells detected within the buffer zones.
+    x_column : str
+        Column name for the x-coordinate in the DataFrames.
+    y_column : str
+        Column name for the y-coordinate in the DataFrames.
+    buffer_distances : list of int
+        List of radii (in spatial units) used for creating buffer zones.
+    original_unit_scale : float
+        Scale factor representing the unit conversion (e.g., 1 unit = N µm).
+    figsize : tuple, optional
+        Size of the generated figure (width, height in inches). Default is (20, 16).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        A Matplotlib Figure object containing the multi-panel visualization.
+
+    Notes
+    -----
+    - The function uses a colorblind-friendly palette (Matplotlib's tab20) for the clustering.
+    - Search radii are visualized using dashed circles drawn around hull neighbor points.
+    - Legends, annotations, and titles are added to convey clustering metrics and analysis steps.
+    """
+    # Filter to show only clustered points
+    df_filtered = df_community[df_community["cluster"] != -1]
+
+    # Create a colormap for clusters
+    unique_clusters = sorted(df_filtered["cluster"].unique())
+    n_clusters = len(unique_clusters)
+
+    # Create a colorblind-friendly color palette for clusters
+    cluster_colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_clusters)))
+    cluster_cmap = mcolors.ListedColormap(cluster_colors[:n_clusters])
+
+    # Create buffer distance colors (using a different color scheme)
+    buffer_colors = {
+        dist: plt.cm.plasma(i / len(buffer_distances))
+        for i, dist in enumerate(buffer_distances)
+    }
+
+    # Calculate data bounds to maintain consistent view across all plots
+    x_min = df_region[x_column].min()
+    x_max = df_region[x_column].max()
+    y_min = df_region[y_column].min()
+    y_max = df_region[y_column].max()
+
+    # Add some padding to the bounds (5% on each side)
+    x_padding = 0.05 * (x_max - x_min)
+    y_padding = 0.05 * (y_max - y_min)
+    x_bounds = [x_min - x_padding, x_max + x_padding]
+    y_bounds = [y_min - y_padding, y_max + y_padding]
+
+    # Create figure with adequate spacing between subplots
+    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+    axes = axes.flatten()
+
+    # PANEL 1: Original clustering
+    ax1 = axes[0]
+    scatter1 = ax1.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered["cluster"],
+        cmap=cluster_cmap,
+        alpha=0.7,
+        s=30,
+        edgecolor="none",
+    )
+
+    # Add background points (all cells in region)
+    ax1.scatter(
+        df_region[x_column],
+        df_region[y_column],
+        color="lightgray",
+        alpha=0.3,
+        s=10,
+        label="All cells",
+    )
+
+    ax1.set_title(f"Clustering of {group} cells in Region {region}", fontsize=14)
+    ax1.set_xlabel(x_column, fontsize=12)
+    ax1.set_ylabel(y_column, fontsize=12)
+    ax1.grid(alpha=0.3)
+    ax1.set_aspect("equal")  # Maintain aspect ratio
+    ax1.set_xlim(x_bounds)
+    ax1.set_ylim(y_bounds)
+
+    # Add legend for clusters in a good position
+    if n_clusters <= 10:  # Only show legend for reasonable number of clusters
+        legend1 = ax1.legend(
+            handles=[
+                Patch(color=cluster_cmap(i), label=f"Cluster {cluster}")
+                for i, cluster in enumerate(unique_clusters)
+            ],
+            title="Clusters",
+            loc="best",
+            frameon=True,
+            bbox_to_anchor=(1.02, 1),
+            fontsize=10,
+        )
+        ax1.add_artist(legend1)
+    else:
+        # Just add a colorbar
+        cbar = fig.colorbar(scatter1, ax=ax1, pad=0.01, shrink=0.8)
+        cbar.set_label("Cluster ID")
+
+    # Annotate with number of clusters using relative positioning
+    # Position in the top-left with padding from the axes
+    ax1.annotate(
+        f"Number of clusters: {n_clusters}",
+        xy=(0.02, 0.98),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+    )
+
+    # PANEL 2: Hull points and polygons
+    ax2 = axes[1]
+
+    # Plot original points with lower alpha
+    ax2.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered["cluster"],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
+    )
+
+    # Plot hull points
+    if not hull.empty:
+        ax2.scatter(
+            hull[x_column],
+            hull[y_column],
+            color="red",
+            s=50,
+            label="Hull Points",
+            edgecolor="black",
+            linewidth=1,
+            alpha=0.8,
+        )
+
+    # Plot the polygons from patches_gdf
+    for idx, patch in patches_gdf.iterrows():
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
+        color = cluster_cmap(cluster_idx)
+
+        # Plot the polygon boundary
+        x, y = patch.geometry.exterior.xy
+        ax2.plot(x, y, color=color, linewidth=2, alpha=0.9)
+
+        # Add label in center of polygon, with smart positioning
+        # Use path effects to ensure visibility against any background
+        centroid = patch.geometry.centroid
+        txt = ax2.text(
+            centroid.x,
+            centroid.y,
+            f"C{patch['cluster']}",
+            fontsize=10,
+            ha="center",
+            va="center",
+            fontweight="bold",
+            color="black",
+        )
+        txt.set_path_effects([PathEffects.withStroke(linewidth=3, foreground="white")])
+
+    ax2.set_title("Hull Points and Resulting Polygons", fontsize=14)
+    ax2.set_xlabel(x_column, fontsize=12)
+    ax2.set_ylabel(y_column, fontsize=12)
+    ax2.grid(alpha=0.3)
+    ax2.set_aspect("equal")  # Maintain aspect ratio
+    ax2.set_xlim(x_bounds)
+    ax2.set_ylim(y_bounds)
+
+    # Position the legend in a less crowded area
+    ax2.legend(loc="best", bbox_to_anchor=(1.02, 1))
+
+    # PANEL 3: Buffer regions
+    ax3 = axes[2]
+
+    # First plot all original polygons with light colors
+    for idx, patch in patches_gdf.iterrows():
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
+        color = cluster_cmap(cluster_idx)
+
+        # Plot the original polygon with a solid line
+        x, y = patch.geometry.exterior.xy
+        ax3.plot(x, y, color=color, linewidth=2, alpha=0.7)
+
+        # For each buffer distance, draw expanded polygons
+        for dist_idx, dist in enumerate(buffer_distances):
+            buffer_color = buffer_colors[dist]
+
+            # Find the corresponding buffer geometry
+            for buffer_geom in buffer_geometries[dist]:
+                if buffer_geom["patch_id"] == idx:
+                    # Draw the expanded polygon with a dashed line
+                    try:
+                        x, y = buffer_geom["expanded"].exterior.xy
+                        ax3.plot(
+                            x,
+                            y,
+                            color=buffer_color,
+                            linewidth=1.5,
+                            linestyle="--",
+                            alpha=0.7,
+                            label=(
+                                f"{dist} unit buffer"
+                                if idx == list(patches_gdf.index)[0] and dist_idx == 0
+                                else ""
+                            ),
+                        )
+                    except:
+                        # Handle MultiPolygons or other complex geometries
+                        if isinstance(buffer_geom["expanded"], MultiPolygon):
+                            for geom in buffer_geom["expanded"].geoms:
+                                x, y = geom.exterior.xy
+                                ax3.plot(
+                                    x,
+                                    y,
+                                    color=buffer_color,
+                                    linewidth=1.5,
+                                    linestyle="--",
+                                    alpha=0.7,
+                                )
+
+    ax3.set_title("Buffer Zones Around Polygons", fontsize=14)
+    ax3.set_xlabel(x_column, fontsize=12)
+    ax3.set_ylabel(y_column, fontsize=12)
+    ax3.grid(alpha=0.3)
+    ax3.set_aspect("equal")  # Maintain aspect ratio
+    ax3.set_xlim(x_bounds)
+    ax3.set_ylim(y_bounds)
+
+    # Create legend for buffer distances with custom positioning
+    buffer_legend_handles = [
+        Patch(color=buffer_colors[dist], alpha=0.7, label=f"{dist} unit buffer")
+        for dist in buffer_distances
+    ]
+    ax3.legend(handles=buffer_legend_handles, loc="best", bbox_to_anchor=(1.02, 1))
+
+    # PANEL 4: Peripheral cells
+    ax4 = axes[3]
+
+    # Plot original polygons
+    for idx, patch in patches_gdf.iterrows():
+        cluster_idx = (
+            unique_clusters.index(patch["cluster"])
+            if patch["cluster"] in unique_clusters
+            else 0
+        )
+        color = cluster_cmap(cluster_idx)
+
+        # Plot the polygon outline
+        x, y = patch.geometry.exterior.xy
+        ax4.plot(x, y, color=color, linewidth=2, alpha=0.7)
+
+    # Plot peripheral cells for each buffer distance
+    for dist in buffer_distances:
+        peripheral_cells = peripheral_results[dist]
+        if peripheral_cells.empty:
+            continue
+
+        # Plot cells with distinct markers for each buffer distance
+        markers = ["o", "s", "^", "d", "*"]  # circle, square, triangle, diamond, star
+        marker = markers[buffer_distances.index(dist) % len(markers)]
+
+        ax4.scatter(
+            peripheral_cells[x_column],
+            peripheral_cells[y_column],
+            color=buffer_colors[dist],
+            marker=marker,
+            s=40,
+            alpha=0.7,
+            edgecolor="black",
+            linewidth=0.5,
+            label=f"Peripheral cells ({dist} unit buffer)",
+        )
+
+    ax4.set_title("Detected Peripheral Cells by Buffer Distance", fontsize=14)
+    ax4.set_xlabel(x_column, fontsize=12)
+    ax4.set_ylabel(y_column, fontsize=12)
+    ax4.grid(alpha=0.3)
+    ax4.set_aspect("equal")  # Maintain aspect ratio
+    ax4.set_xlim(x_bounds)
+    ax4.set_ylim(y_bounds)
+
+    # Position the legend outside the plot area if it might overlap with data
+    ax4.legend(loc="best", bbox_to_anchor=(1.02, 1))
+
+    # Add overall title with enough space
+    fig.suptitle(
+        f"Patch Proximity Analysis for {group} in Region {region}", fontsize=18, y=0.98
+    )
+
+    # Add explanatory text at the bottom with enough padding
+    # Position it well below the plots to avoid overlap
+    explanation_text = (
+        f"This analysis identifies clusters of {group} cells, creates boundary polygons, and detects "
+        f"nearby cells within {', '.join(map(str, buffer_distances))} unit buffer zones. "
+    )
+
+    fig.text(
+        0.5,
+        0.01,
+        explanation_text,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8),
+    )
+
+    # Make sure layout adapts to the content
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    return fig
+
+
+def create_visualization_border_cell_radius(
+    region_name,
+    group_name,
+    df_community,
+    df_full,
+    cluster_column="cluster",
+    identification_column=None,
+    x_column="x",
+    y_column="y",
+    radius=200,
+    hull_points=None,
+    proximity_results=None,
+    hull_neighbors=None,
+    figsize=(20, 16),
+):
+    """
+    Create a multi-panel visualization for the border cell radius proximity analysis method.
+
+    This function generates a figure that illustrates the workflow of the analysis by
+    plotting four panels: (1) the original clustering with noise indicated, (2) the concave hull
+    boundary detection, (3) the radius search visualization from all hull points, and (4) the
+    proximity results showing points from different categories near the cluster boundaries.
+    Each panel is carefully formatted to maintain a consistent view across the plots.
+
+    Parameters
+    ----------
+    region_name : str
+        Name of the region being analyzed.
+    group_name : str
+        Name of the cell group (or category) under investigation.
+    df_community : pandas.DataFrame
+        DataFrame containing the subset of cells (community) used for clustering and further analysis.
+    df_full : pandas.DataFrame
+        DataFrame containing all the cells in the region for context in plots.
+    cluster_column : str, optional
+        Column name for cluster labels in df_community. Default is "cluster".
+    identification_column : str, optional
+        Column name used to identify cell categories when plotting proximity results. Default is None.
+    x_column : str, optional
+        Column name for the x-coordinate in the DataFrames. Default is "x".
+    y_column : str, optional
+        Column name for the y-coordinate in the DataFrames. Default is "y".
+    radius : int or list of int, optional
+        The radius or list of radii (in the same units as the coordinates) used for the proximity search.
+        Default is 200.
+    hull_points : pandas.DataFrame, optional
+        DataFrame containing the points that form the concave hull boundaries of clusters.
+        If provided, these points are used for visualizing the hull boundaries. Default is None.
+    proximity_results : pandas.DataFrame, optional
+        DataFrame containing the results from the proximity search (cells near the hull points)
+        with additional information (e.g. distance from patch). Default is None.
+    hull_neighbors : pandas.DataFrame, optional
+        DataFrame containing the hull neighbor points where the search circles (radii) are drawn.
+        Default is None.
+    figsize : tuple, optional
+        Size of the generated figure in inches (width, height). Default is (20, 16).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        A Matplotlib Figure object that contains the generated multi-panel visualization.
+
+    Notes
+    -----
+    - The function uses the matplotlib patches (Circle) to draw search radii around each hull point.
+    - A colorblind-friendly color palette (tab20 from Matplotlib) is used for representing cluster identities.
+    - If a single radius is provided, it is internally converted to a list to allow uniform processing.
+    - Legends and annotations are added to provide additional context on the clustering and proximity metrics.
+    """
+    from matplotlib.patches import Circle
+
+    # Filter to show only clustered points
+    df_filtered = df_community[df_community[cluster_column] != -1]
+
+    # Create a colormap for clusters
+    unique_clusters = sorted(df_filtered[cluster_column].unique())
+    n_clusters = len(unique_clusters)
+
+    # Create a colorblind-friendly color palette for clusters
+    cluster_colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_clusters)))
+    cluster_cmap = mcolors.ListedColormap(cluster_colors[:n_clusters])
+
+    # Convert radius to list if it's a single value
+    if not isinstance(radius, (list, tuple, np.ndarray)):
+        radius_list = [radius]
+    else:
+        radius_list = radius
+
+    # Create a color mapping for different radii
+    radius_colors = plt.cm.plasma(np.linspace(0, 0.8, len(radius_list)))
+    radius_color_map = {r: radius_colors[i] for i, r in enumerate(radius_list)}
+
+    # Calculate data bounds to maintain consistent view across all plots
+    x_min = df_full[x_column].min()
+    x_max = df_full[x_column].max()
+    y_min = df_full[y_column].min()
+    y_max = df_full[y_column].max()
+
+    # Add some padding to the bounds (5% on each side)
+    x_padding = 0.05 * (x_max - x_min)
+    y_padding = 0.05 * (y_max - y_min)
+    x_bounds = [x_min - x_padding, x_max + x_padding]
+    y_bounds = [y_min - y_padding, y_max + y_padding]
+
+    # Create figure with adequate spacing between subplots
+    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+    axes = axes.flatten()
+
+    # PANEL 1: Original clustering
+
+    ax1 = axes[0]
+
+    # Plot all points in the region with low opacity
+    ax1.scatter(
+        df_full[x_column],
+        df_full[y_column],
+        color="lightgray",
+        alpha=0.3,
+        s=10,
+        label="All cells",
+    )
+
+    # Plot clustered points with colors by cluster
+    scatter1 = ax1.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.7,
+        s=30,
+        edgecolor="none",
+    )
+
+    # Mark noise points with 'x'
+    noise_points = df_community[df_community[cluster_column] == -1]
+    if len(noise_points) > 0:
+        ax1.scatter(
+            noise_points[x_column],
+            noise_points[y_column],
+            color="gray",
+            marker="x",
+            s=20,
+            alpha=0.5,
+            label="Noise points",
+        )
+
+    ax1.set_title(
+        f"HDBSCAN Clustering of {group_name} in Region {region_name}", fontsize=14
+    )
+    ax1.set_xlabel(x_column, fontsize=12)
+    ax1.set_ylabel(y_column, fontsize=12)
+    ax1.grid(alpha=0.3)
+    ax1.set_aspect("equal")
+    ax1.set_xlim(x_bounds)
+    ax1.set_ylim(y_bounds)
+
+    # Add legend for clusters
+    if n_clusters <= 10:  # Only show legend for reasonable number of clusters
+        legend1 = ax1.legend(
+            handles=[
+                Patch(color=cluster_cmap(i), label=f"Cluster {cluster}")
+                for i, cluster in enumerate(unique_clusters)
+            ],
+            title="Clusters",
+            loc="best",
+            frameon=True,
+            bbox_to_anchor=(1.02, 1),
+            fontsize=10,
+        )
+        ax1.add_artist(legend1)
+    else:
+        # Add colorbar instead
+        cbar = fig.colorbar(scatter1, ax=ax1, pad=0.01, shrink=0.8)
+        cbar.set_label("Cluster ID")
+
+    # Annotate with number of clusters and noise points
+    ax1.annotate(
+        f"Number of clusters: {n_clusters}\n" f"Noise points: {len(noise_points)}",
+        xy=(0.02, 0.98),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+    )
+
+    # PANEL 2: Concave Hull Identification
+
+    ax2 = axes[1]
+
+    # Plot clustered points with reduced opacity
+    ax2.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
+    )
+
+    # Plot hull points if provided
+    if hull_points is not None and len(hull_points) > 0:
+        # Group by cluster if multiple clusters
+        for cluster in unique_clusters:
+            cluster_hull = (
+                hull_points[hull_points["patch_id"] == cluster]
+                if "patch_id" in hull_points.columns
+                else hull_points
+            )
+
+            if len(cluster_hull) > 0:
+                # Plot hull points
+                ax2.scatter(
+                    cluster_hull[x_column],
+                    cluster_hull[y_column],
+                    color="red",
+                    s=50,
+                    edgecolor="black",
+                    linewidth=1,
+                    alpha=0.8,
+                    label="Hull Points" if cluster == unique_clusters[0] else "",
+                )
+
+                # Connect hull points to show the boundary
+                if len(cluster_hull) > 2:
+                    hull_x = cluster_hull[x_column].values
+                    hull_y = cluster_hull[y_column].values
+
+                    # If ordered by 'order' column, use that ordering
+                    if "order" in cluster_hull.columns:
+                        ordered_hull = cluster_hull.sort_values("order")
+                        hull_x = ordered_hull[x_column].values
+                        hull_y = ordered_hull[y_column].values
+
+                    # Close the loop by adding the first point again
+                    hull_x = np.append(hull_x, hull_x[0])
+                    hull_y = np.append(hull_y, hull_y[0])
+
+                    cluster_idx = unique_clusters.index(cluster)
+                    color = cluster_cmap(cluster_idx)
+                    ax2.plot(
+                        hull_x,
+                        hull_y,
+                        color=color,
+                        linestyle="-",
+                        linewidth=2,
+                        alpha=0.7,
+                        label=(
+                            f"Hull Boundary (C{cluster})"
+                            if cluster == unique_clusters[0]
+                            else ""
+                        ),
+                    )
+
+    ax2.set_title("Concave Hull Boundary Detection", fontsize=14)
+    ax2.set_xlabel(x_column, fontsize=12)
+    ax2.set_ylabel(y_column, fontsize=12)
+    ax2.grid(alpha=0.3)
+    ax2.set_aspect("equal")
+    ax2.set_xlim(x_bounds)
+    ax2.set_ylim(y_bounds)
+
+    # Add explanation of concave hull
+    ax2.annotate(
+        "Concave hull forms the\nouter boundary of each cluster",
+        xy=(0.02, 0.02),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+    )
+
+    ax2.legend(loc="best", bbox_to_anchor=(1.02, 1))
+
+    # PANEL 3: Radius Search from Hull Points
+
+    ax3 = axes[2]
+
+    # Plot background with even lower alpha to make circles more visible
+    ax3.scatter(
+        df_full[x_column], df_full[y_column], color="lightgray", alpha=0.1, s=10
+    )
+
+    # Plot clustered points with lower alpha to improve circle visibility
+    ax3.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.3,
+        s=20,
+    )
+
+    # Show search radius from ALL hull points with improved visibility
+    if hull_neighbors is not None and len(hull_neighbors) > 0:
+        # Better alpha calculation - minimum 0.2 alpha to ensure visibility
+        num_circles = len(hull_neighbors) * len(radius_list)
+        min_alpha = 0.2  # Minimum alpha value for visibility
+
+        # If many circles, use a more aggressive scale-down but never below min_alpha
+        if num_circles > 30:
+            circle_alpha = max(min_alpha, 0.6 - (num_circles - 30) * 0.005)
+        else:
+            circle_alpha = max(min_alpha, 0.6 - num_circles * 0.005)
+
+        # Create a list to hold circle objects for the legend
+        legend_circles = []
+
+        # Draw circles for all hull points with different colors for each radius
+        for idx, hull_point in hull_neighbors.iterrows():
+            for r_idx, r in enumerate(radius_list):
+                # Get color for this radius
+                circle_color = radius_color_map[r]
+                circle_width = 1.0  # Slightly thicker lines
+
+                # Draw search circle with improved visibility
+                circle = Circle(
+                    (hull_point[x_column], hull_point[y_column]),
+                    r,
+                    color=circle_color,
+                    fill=False,
+                    linestyle="--",
+                    linewidth=circle_width,
+                    alpha=circle_alpha,
+                )
+                ax3.add_patch(circle)
+
+                # Create a single circle for legend (only once per radius)
+                if idx == 0:
+                    legend_circle = Circle(
+                        (0, 0),
+                        1,
+                        color=circle_color,
+                        fill=False,
+                        linestyle="--",
+                        linewidth=circle_width,
+                        alpha=0.8,
+                    )
+                    ax3.add_patch(legend_circle)
+                    legend_circle.set_visible(False)  # Hide it, just for legend
+                    legend_circles.append((legend_circle, f"Search radius ({r} units)"))
+
+        # Hull points are drawn on top of circles with high visibility
+        ax3.scatter(
+            hull_neighbors[x_column],
+            hull_neighbors[y_column],
+            color="red",
+            s=40,
+            edgecolor="black",
+            linewidth=0.8,
+            alpha=0.8,
+            label="Hull Points",
+        )
+
+    # Format radii for title
+    radii_str = (
+        ", ".join(map(str, radius_list))
+        if len(radius_list) > 1
+        else str(radius_list[0])
+    )
+    ax3.set_title(f"Search Radii ({radii_str} units) from Hull Points", fontsize=14)
+    ax3.set_xlabel(x_column, fontsize=12)
+    ax3.set_ylabel(y_column, fontsize=12)
+    ax3.grid(alpha=0.3)
+    ax3.set_aspect("equal")
+    ax3.set_xlim(x_bounds)
+    ax3.set_ylim(y_bounds)
+
+    # Add explanation of search radius
+    if hull_neighbors is not None:
+        radius_text = (
+            ", ".join(map(str, radius_list))
+            if len(radius_list) > 1
+            else str(radius_list[0])
+        )
+        ax3.annotate(
+            f"All {len(hull_neighbors)} hull points search for\n"
+            f"neighboring cells within {radius_text} units",
+            xy=(0.02, 0.02),
+            xycoords="axes fraction",
+            fontsize=11,
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+        )
+
+    # Legend for radius circles
+    if hull_neighbors is not None and len(hull_neighbors) > 0 and legend_circles:
+        circles, labels = zip(*legend_circles)
+        ax3.legend(circles, labels, loc="upper right")
+
+    # PANEL 4: Proximity Results - Show all points
+
+    ax4 = axes[3]
+
+    # Start with background - all points in the dataset with low opacity
+    ax4.scatter(
+        df_full[x_column],
+        df_full[y_column],
+        color="lightgray",
+        alpha=0.15,
+        s=10,
+        label="All cells",
+    )
+
+    # Plot clustered points with colors by cluster to highlight the community
+    ax4.scatter(
+        df_filtered[x_column],
+        df_filtered[y_column],
+        c=df_filtered[cluster_column],
+        cmap=cluster_cmap,
+        alpha=0.4,
+        s=20,
+    )
+
+    # Plot hull points with increased visibility
+    if hull_points is not None and len(hull_points) > 0:
+        ax4.scatter(
+            hull_points[x_column],
+            hull_points[y_column],
+            color="red",
+            s=30,
+            alpha=0.7,
+            edgecolor="black",
+            linewidth=0.5,
+            label="Hull Points",
+        )
+
+    # Plot proximity results (points from other categories near hull)
+    if proximity_results is not None and len(proximity_results) > 0:
+        # Check if we need to visualize different radii
+        if "distance_from_patch" in proximity_results.columns and len(radius_list) > 1:
+            # For each radius, plot points with a different marker or color
+            for r_idx, r in enumerate(radius_list):
+                r_points = proximity_results[
+                    proximity_results["distance_from_patch"] == r
+                ]
+
+                if len(r_points) > 0:
+                    # If identification column is provided, use different colors for categories
+                    if (
+                        identification_column is not None
+                        and identification_column in r_points.columns
+                    ):
+                        # Get unique categories in proximity results
+                        prox_categories = r_points[identification_column].unique()
+
+                        # Create color mapping for categories
+                        category_colors = plt.cm.Set2(
+                            np.linspace(0, 1, len(prox_categories))
+                        )
+
+                        # Markers for different radii (cycle through a few options)
+                        markers = [
+                            "o",
+                            "s",
+                            "^",
+                            "d",
+                            "*",
+                        ]  # circle, square, triangle, diamond, star
+                        marker = markers[r_idx % len(markers)]
+
+                        # Plot each category with different color but same marker for this radius
+                        for i, category in enumerate(prox_categories):
+                            category_points = r_points[
+                                r_points[identification_column] == category
+                            ]
+                            ax4.scatter(
+                                category_points[x_column],
+                                category_points[y_column],
+                                color=category_colors[i],
+                                marker=marker,
+                                s=80,
+                                alpha=0.8,
+                                edgecolor="black",
+                                linewidth=0.5,
+                                label=f"{category} ({r} units)",
+                            )
+                    else:
+                        # Use same color scheme as for radius circles with different markers
+                        color = radius_color_map[r]
+                        markers = ["o", "s", "^", "d", "*"]
+                        marker = markers[r_idx % len(markers)]
+
+                        ax4.scatter(
+                            r_points[x_column],
+                            r_points[y_column],
+                            color=color,
+                            marker=marker,
+                            s=80,
+                            alpha=0.8,
+                            edgecolor="black",
+                            linewidth=0.5,
+                            label=f"Proximity Points ({r} units)",
+                        )
+        else:
+            # Original behavior for single radius
+            if (
+                identification_column is not None
+                and identification_column in proximity_results.columns
+            ):
+                # Get unique categories in proximity results
+                prox_categories = proximity_results[identification_column].unique()
+
+                # Create color mapping for categories
+                category_colors = plt.cm.Set2(np.linspace(0, 1, len(prox_categories)))
+
+                # Plot each category with different color
+                for i, category in enumerate(prox_categories):
+                    category_points = proximity_results[
+                        proximity_results[identification_column] == category
+                    ]
+                    ax4.scatter(
+                        category_points[x_column],
+                        category_points[y_column],
+                        color=category_colors[i],
+                        marker="o",
+                        s=80,
+                        alpha=0.8,
+                        edgecolor="black",
+                        linewidth=0.5,
+                        label=f"{category}",
+                    )
+            else:
+                # Plot all proximity points with same color
+                ax4.scatter(
+                    proximity_results[x_column],
+                    proximity_results[y_column],
+                    color="gold",
+                    marker="o",
+                    s=80,
+                    alpha=0.8,
+                    edgecolor="black",
+                    linewidth=0.5,
+                    label="Proximity Points",
+                )
+
+    ax4.set_title("Detected Points in Proximity to Clusters", fontsize=14)
+    ax4.set_xlabel(x_column, fontsize=12)
+    ax4.set_ylabel(y_column, fontsize=12)
+    ax4.grid(alpha=0.3)
+    ax4.set_aspect("equal")
+    ax4.set_xlim(x_bounds)
+    ax4.set_ylim(y_bounds)
+
+    # Add explanation text
+    prox_count = len(proximity_results) if proximity_results is not None else 0
+    ax4.annotate(
+        f"Found {prox_count} cells from different\ncategories near cluster boundaries",
+        xy=(0.02, 0.02),
+        xycoords="axes fraction",
+        fontsize=11,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+    )
+
+    # Position the legend
+    ax4.legend(loc="best", bbox_to_anchor=(1.02, 1))
+
+    # Add overall title and explanation
+
+    fig.suptitle(
+        f"Border Cell Radius Proximity Analysis for {group_name} in Region {region_name}",
+        fontsize=18,
+        y=0.98,
+    )
+
+    # Add explanatory text at the bottom with radius list
+    radii_text = (
+        ", ".join(map(str, radius_list))
+        if len(radius_list) > 1
+        else str(radius_list[0])
+    )
+    explanation_text = (
+        "This analysis: (1) Clusters cells using HDBSCAN algorithm, (2) Identifies the concave hull boundary of each cluster, "
+        f"(3) For each hull point, searches for cells within {radii_text} units, and "
+        "(4) Identifies cells from different categories that are in proximity to cluster boundaries."
+    )
+
+    fig.text(
+        0.5,
+        0.01,
+        explanation_text,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow", ec="orange", alpha=0.8),
+    )
+
+    # Make sure layout adapts to the content
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    return fig

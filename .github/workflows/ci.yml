@@ -80,24 +80,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # libvips
-      - name: Install libvips on Ubuntu
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: sudo apt-get install -y libvips graphviz
-      # # TODO: Can't get this to run
-      # # - name: Install libvips on Windows
-      # #   if: startsWith(matrix.platform, 'windows')
-      # #   run: choco install nip2
-      # - name: Install libvips on Mac
-      #   if: startsWith(matrix.platform, 'macos')
-      #   run: brew install vips
-
-      # - name: Setup Graphviz
-      #   uses: tlylt/install-graphviz@v1
-
       - name: Retrieve pre-built distribution files
         uses: actions/download-artifact@v4
         with: {name: python-distribution-files, path: dist/}
+
+      # UBUNTU
+      - name: Install dependencies (ubuntu)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: sudo apt install -y libvips graphviz
 
       - name: Run tests (ubuntu)
         if: startsWith(matrix.platform, 'ubuntu')
@@ -105,6 +95,17 @@ jobs:
           pipx run --python '${{ steps.setup-python.outputs.python-path }}'
           tox -e platform-ubuntu --installpkg '${{ needs.prepare.outputs.wheel-distribution }}'
           -- -rFEx --durations 10 --color yes  # pytest args
+
+      # MAC OS
+      # TODO: Fix the environment variable situation ... could probably be simplified
+      - name: Install dependencies (macos)
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          brew install vips graphviz
+          echo "DYLD_LIBRARY_PATH = ${DYLD_LIBRARY_PATH}:/opt/homebrew/Cellar/vips/$(brew list --versions vips | awk '{print $2}')/lib:/opt/homebrew/Cellar/openslide/$(brew list --versions openslide | awk '{print $2}')/lib" >> $GITHUB_ENV
+          echo "TF_CPP_MIN_LOG_LEVEL = 2" >> $GITHUB_ENV
+          echo "CUDA_VISIBLE_DEVICES = -1" >> $GITHUB_ENV
+
       - name: Run tests (macos)
         if: startsWith(matrix.platform, 'macos')
         run: >-

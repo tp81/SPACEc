@@ -58,7 +58,7 @@ def test_cell_segmentation():
         # choose between cellpose or mesmer for segmentation
         # first image
         # seg_output contains {'img': img, 'image_dict': image_dict, 'masks': masks}
-        seg_output1 = sp.tl.cell_segmentation(
+        seg_output2 = sp.tl.cell_segmentation(
             file_name=data_path / "raw/tonsil/1/reg010_X01_Y01_Z01.tif",
             channel_file=data_path / "raw/tonsil/channelnames.txt",
             output_dir=output_dir,
@@ -156,7 +156,7 @@ def test_cell_segmentation():
 
         print("Show Masks Cellpose")
         overlay_data1, rgb_images1 = sp.pl.show_masks(
-            seg_output=seg_output_cellpose,
+            seg_output=seg_output2,
             nucleus_channel="DAPI",  # channel used for nuclei segmentation (displayed in blue)
             additional_channels=[
                 "CD45",

@@ -97,6 +97,7 @@ jobs:
           -- -rFEx --durations 10 --color yes  # pytest args
 
       # MAC OS
+      # TODO: Fix the environment variable situation ... could probably be simplified
       - name: Install dependencies (macos)
         if: startsWith(matrix.platform, 'macos')
         run: |

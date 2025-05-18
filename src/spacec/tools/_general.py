@@ -1665,6 +1665,445 @@ def remove_rare_cell_types(
     return distance_pvals
 
 
+# Function for patch identification
+## Adjust clustering parameter to get the desired number of clusters
+def apply_dbscan_clustering(df, min_cluster_size=10):
+    """
+    Apply DBSCAN clustering to a dataframe and update the cluster labels in the original dataframe.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The dataframe to be clustered.
+    min_cluster_size : int, optional
+        The number of samples in a neighborhood for a point to be considered as a core point, by default 10
+    Returns
+    -------
+    None
+    """
+    # Initialize a new column for cluster labels
+    df["cluster"] = -1
+    # Apply DBSCAN clustering
+    hdbscan = HDBSCAN(
+        min_samples=None,
+        min_cluster_size=min_cluster_size,
+        cluster_selection_epsilon=0.0,
+        max_cluster_size=None,
+        metric="euclidean",
+        alpha=1.0,
+        cluster_selection_method="eom",
+        allow_single_cluster=True,
+    )
+    labels = hdbscan.fit_predict(df[["x", "y"]])
+    # Number of clusters in labels, ignoring noise if present.
+    n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise_ = list(labels).count(-1)
+    print("Estimated number of clusters: %d" % n_clusters_)
+    print("Estimated number of noise points: %d" % n_noise_)
+    # Update the cluster labels in the original dataframe
+    df.loc[df.index, "cluster"] = labels
+
+
+def identify_points_in_proximity(
+    df,
+    full_df,
+    identification_column,
+    cluster_column="cluster",
+    x_column="x",
+    y_column="y",
+    radius=200,
+    edge_neighbours=3,
+    plot=True,
+    concave_hull_length_threshold=50,
+):
+    """
+    Identify points in proximity within clusters and generate result and outline DataFrames.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the points to be processed.
+    full_df : pandas.DataFrame
+        Full DataFrame containing all points.
+    identification_column : str
+        Column name used for identification.
+    cluster_column : str, optional
+        Column name for cluster labels, by default "cluster".
+    x_column : str, optional
+        Column name for x-coordinates, by default "x".
+    y_column : str, optional
+        Column name for y-coordinates, by default "y".
+    radius : int, optional
+        Radius for proximity search, by default 200.
+    edge_neighbours : int, optional
+        Number of edge neighbours, by default 3.
+    plot : bool, optional
+        Whether to plot the results, by default True.
+    concave_hull_length_threshold : int, optional
+        Threshold for concave hull length, by default 50.
+
+    Returns
+    -------
+    result : pandas.DataFrame
+        DataFrame containing the result points.
+    outlines : pandas.DataFrame
+        DataFrame containing the outline points.
+    """
+
+    nbrs, unique_clusters = precompute(
+        df, x_column, y_column, full_df, identification_column, edge_neighbours
+    )
+    num_processes = max(
+        1, os.cpu_count() - 1
+    )  # Use all available CPUs minus 2, but at least 1
+    with Pool(processes=num_processes) as pool:
+        results = pool.starmap(
+            process_cluster,
+            [
+                (
+                    (
+                        df,
+                        cluster,
+                        cluster_column,
+                        x_column,
+                        y_column,
+                        concave_hull_length_threshold,
+                        edge_neighbours,
+                        full_df,
+                        radius,
+                        plot,
+                        identification_column,
+                    ),
+                    nbrs,
+                    unique_clusters,
+                )
+                for cluster in set(df[cluster_column]) - {-1}
+            ],
+        )
+    # Unpack the results
+    result_list, outline_list = zip(*results)
+    # Concatenate the list of DataFrames into a single result DataFrame
+    if len(result_list) > 0:
+        result = pd.concat(result_list)
+    else:
+        result = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+    if len(outline_list) > 0:
+        outlines = pd.concat(outline_list)
+    else:
+        outlines = pd.DataFrame(columns=["x", "y", "patch_id", identification_column])
+    return result, outlines
+
+
+# Precompute nearest neighbors model and unique clusters
+def precompute(df, x_column, y_column, full_df, identification_column, edge_neighbours):
+    """
+    Precompute nearest neighbors and unique clusters.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the points to be processed.
+    x_column : str
+        Column name for x-coordinates.
+    y_column : str
+        Column name for y-coordinates.
+    full_df : pandas.DataFrame
+        Full DataFrame containing all points.
+    identification_column : str
+        Column name used for identification.
+    edge_neighbours : int
+        Number of edge neighbours.
+
+    Returns
+    -------
+    nbrs : sklearn.neighbors.NearestNeighbors
+        Fitted NearestNeighbors model.
+    unique_clusters : numpy.ndarray
+        Array of unique cluster identifiers.
+    """
+    nbrs = NearestNeighbors(n_neighbors=edge_neighbours).fit(df[[x_column, y_column]])
+    unique_clusters = full_df[identification_column].unique()
+    return nbrs, unique_clusters
+
+
+def process_cluster(args, nbrs, unique_clusters):
+    (
+        df,
+        cluster,
+        cluster_column,
+        x_column,
+        y_column,
+        concave_hull_length_threshold,
+        edge_neighbours,
+        full_df,
+        radius,
+        plot,
+        identification_column,
+    ) = args
+
+    """
+    Process a single cluster to identify points in proximity and generate hull points.
+
+    Parameters
+    ----------
+    args : tuple
+        Tuple containing the following elements:
+        - df : pandas.DataFrame
+            DataFrame containing the points to be processed.
+        - cluster : int
+            Cluster identifier.
+        - cluster_column : str
+            Column name for cluster labels.
+        - x_column : str
+            Column name for x-coordinates.
+        - y_column : str
+            Column name for y-coordinates.
+        - concave_hull_length_threshold : int
+            Threshold for concave hull length.
+        - edge_neighbours : int
+            Number of edge neighbours.
+        - full_df : pandas.DataFrame
+            Full DataFrame containing all points.
+        - radius : int
+            Radius for proximity search.
+        - plot : bool
+            Whether to plot the results.
+        - identification_column : str
+            Column name used for identification.
+    nbrs : sklearn.neighbors.NearestNeighbors
+        Fitted NearestNeighbors model.
+    unique_clusters : numpy.ndarray
+        Array of unique cluster identifiers.
+
+    Returns
+    -------
+    prox_points : pandas.DataFrame
+        DataFrame containing points within the proximity of the cluster.
+    hull_nearest_neighbors : pandas.DataFrame
+        DataFrame containing the nearest neighbors of the hull points.
+    """
+
+    # Filter DataFrame for the current cluster
+    subset = df.loc[df[cluster_column] == cluster]
+    points = subset[[x_column, y_column]].values
+    # Compute concave hull indexes
+    idxes = concave_hull_indexes(
+        points[:, :2],
+        length_threshold=concave_hull_length_threshold,
+    )
+    # Get hull points from the DataFrame
+    hull_points = pd.DataFrame(points[idxes], columns=["x", "y"])
+    # Find nearest neighbors of hull points in the original DataFrame
+    distances, indices = nbrs.kneighbors(hull_points[["x", "y"]])
+    hull_nearest_neighbors = df.iloc[indices.flatten()]
+    # DataFrame to store points within the circle but from a different cluster
+    all_in_circle_diff_cluster = []
+    # Extract hull points coordinates
+    hull_coords = hull_nearest_neighbors[["x", "y"]].values
+    # Calculate distances from all points in full_df to all hull points
+    distances = cdist(full_df[["x", "y"]].values, hull_coords)
+    # Identify points within the circle for each hull point
+    in_circle = distances <= radius
+    # Identify points from a different cluster for each hull point
+    diff_cluster = (
+        full_df[identification_column].values[:, np.newaxis]
+        != hull_nearest_neighbors[identification_column].values
+    )
+    # Combine the conditions
+    in_circle_diff_cluster = in_circle & diff_cluster
+    # Collect all points within the circle but from a different cluster
+    all_in_circle_diff_cluster = full_df[np.any(in_circle_diff_cluster, axis=1)]
+    # Plot the points with a different shape if plot is True
+    if plot:
+        plt.scatter(
+            all_in_circle_diff_cluster["x"],
+            all_in_circle_diff_cluster["y"],
+            facecolors="none",
+            edgecolors="#DC0000B2",
+            marker="*",
+            s=100,
+            zorder=5,
+            label="Cell within proximity",
+        )
+    # Remove duplicates from the final DataFrame
+    all_in_circle_diff_cluster = all_in_circle_diff_cluster.drop_duplicates()
+    # Plot selected points in yellow and draw circles around them if plot is True
+    if plot:
+        plt.scatter(
+            hull_nearest_neighbors["x"],
+            hull_nearest_neighbors["y"],
+            color="#3C5488B2",
+            label="Boarder cells",
+            s=100,
+            edgecolor="black",
+            zorder=6,
+        )
+        for _, row in hull_nearest_neighbors.iterrows():
+            circle = plt.Circle(
+                (row["x"], row["y"]),
+                radius,
+                color="#3C5488B2",
+                fill=False,
+                linestyle="--",
+                alpha=0.5,
+            )
+            plt.gca().add_patch(circle)
+        # Set plot labels and title
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.title(f"Cells within {radius} radius")
+        plt.grid(False)
+        plt.axis("equal")
+        # Place the legend outside the plot
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        plt.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="center left",
+            bbox_to_anchor=(1, 0.5),
+        )
+        plt.tight_layout()
+        # set figure size
+        plt.gcf().set_size_inches(15, 5)
+        plt.show()
+    # Remove duplicates from the final DataFrame
+    prox_points = all_in_circle_diff_cluster.drop_duplicates()
+    # Add a 'patch_id' column to identify the cluster
+    prox_points["patch_id"] = cluster
+    return prox_points, hull_nearest_neighbors
+
+
+# This function analyzes what is in proximity of a selected group (CN, Celltype, etc...).
+def patch_proximity_analysis(
+    adata,
+    region_column,
+    patch_column,
+    group,
+    min_cluster_size=80,
+    x_column="x",
+    y_column="y",
+    radius=128,
+    edge_neighbours=3,
+    plot=True,
+    savefig=False,
+    output_dir="./",
+    output_fname="",
+    key_name="ppa_result",
+    plot_color="#6a3d9a",
+):
+    """
+    Performs a proximity analysis on patches of a given group within each region of a dataset.
+
+    Parameters:
+    adata (AnnData): The annotated data matrix of shape n_obs x n_vars. Rows correspond to cells and columns to genes.
+    region_column (str): The name of the column in the DataFrame that contains the region information.
+    patch_column (str): The name of the column in the DataFrame that contains the patch information.
+    group (str): The group to perform the proximity analysis on.
+    min_cluster_size (int, optional): The minimum number of samples required to form a dense region. Default is 80.
+    x_column (str, optional): The name of the column in the DataFrame that contains the x-coordinate. Default is 'x'.
+    y_column (str, optional): The name of the column in the DataFrame that contains the y-coordinate. Default is 'y'.
+    radius (int, optional): The radius within which to identify points in proximity. Default is 128.
+    edge_neighbours (int, optional): The number of edge neighbours to consider. Default is 3.
+    plot (bool, optional): Whether to plot the patches. Default is True.
+    savefig (bool, optional): Whether to save the figure. Default is False.
+    output_dir (str, optional): The directory to save the figure in. Default is "./".
+    output_fname (str, optional): The filename to save the figure as. Default is "".
+    key_name (str, optional): The key name to store the results in the AnnData object. Default is 'ppa_result'.
+
+    Returns:
+    final_results (DataFrame): A DataFrame containing the results of the proximity analysis.
+    outlines_results (DataFrame): A DataFrame containing the outlines of the patches.
+    """
+
+    df = adata.obs
+
+    for col in df.select_dtypes(["category"]).columns:
+        df[col] = df[col].astype(str)
+
+    # list to store results for each region
+    region_results = []
+    outlines = []
+
+    for region in df[region_column].unique():
+        df_region = df[df[region_column] == region].copy()
+
+        df_community = df_region[df_region[patch_column] == group].copy()
+
+        if df_community.shape[0] < min_cluster_size:
+            print(f"No {group} in {region}")
+            continue
+
+        else:
+            apply_dbscan_clustering(df_community, min_cluster_size=min_cluster_size)
+
+            # plot patches
+            if plot:
+                df_filtered = df_community[df_community["cluster"] != -1]
+                fig, ax = plt.subplots(figsize=(10, 10))
+                ax.scatter(
+                    df_filtered[x_column],
+                    df_filtered[y_column],
+                    c=plot_color,
+                    alpha=0.5,
+                )
+                ax.set_title(f"HDBSCAN Clusters for {region}_{group}")
+                ax.set_xlabel(x_column)
+                ax.set_ylabel(y_column)
+                ax.grid(False)
+                ax.axis("equal")
+
+                if savefig:
+                    fig.savefig(
+                        output_dir
+                        + output_fname
+                        + "_"
+                        + str(region)
+                        + "_patch_proximity.pdf",
+                        bbox_inches="tight",
+                    )
+                else:
+                    plt.show()
+
+            results, hull_nearest_neighbors = identify_points_in_proximity(
+                df=df_community,
+                full_df=df_region,
+                cluster_column="cluster",
+                identification_column=patch_column,
+                x_column=x_column,
+                y_column=y_column,
+                radius=radius,
+                edge_neighbours=edge_neighbours,
+                plot=plot,
+            )
+
+            # add hull_nearest_neighbors to list
+            outlines.append(hull_nearest_neighbors)
+
+            print(f"Finished {region}_{group}")
+
+            # append to region_results
+            region_results.append(results)
+
+    # Concatenate all results into a single DataFrame
+    final_results = pd.concat(region_results)
+
+    outlines_results = pd.concat(outlines)
+
+    # generate new column named unique_patch_ID that combines the region, group and patch ID
+    final_results["unique_patch_ID"] = (
+        final_results[region_column]
+        + "_"
+        + final_results[patch_column].astype(str)
+        + "_"
+        + "patch_no_"
+        + final_results["patch_id"].astype(str)
+    )
+
+    adata.uns[key_name] = final_results
+
+    return final_results, outlines_results
+
+
 def stellar_get_edge_index(
     pos, distance_thres, max_memory_usage=1.6e10, chunk_size=1000
 ):

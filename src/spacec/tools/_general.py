@@ -1973,6 +1973,7 @@ def process_cluster(args, nbrs, unique_clusters):
     prox_points["patch_id"] = cluster
     return prox_points, hull_nearest_neighbors
 
+
 def stellar_get_edge_index(
     pos,
     distance_thres,
